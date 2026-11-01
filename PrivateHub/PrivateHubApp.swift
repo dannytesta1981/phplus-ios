@@ -298,7 +298,7 @@ struct PortalEditor: View {
         if let host = retainedHost { return host }
         if entry == nil { entry = url }
         let host = BrowserHost(); retainedHost = host
-        host.onWindowChange = { [weak self] visible in
+        host.onWindowChange = { [weak self, weak host] visible in
             if visible { self?.retainedCoordinator?.resumeMediaIfAllowed() }
             else {
                 // Ignore detach/reattach within one SwiftUI update. Real background

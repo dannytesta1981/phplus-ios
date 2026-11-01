@@ -20,7 +20,10 @@ import AVFoundation
         throw NSError(domain: "FixtureTimeout", code: 2)
     }
     func ready(_ view: WKWebView, path: String) async throws {
-        try await waitFor { (try await view.evaluateJavaScript("document.readyState === 'complete' && location.pathname === '\(path)' && !!document.getElementById('fixtureReady')")) as? Bool == true }
+        try await waitFor {
+            guard !view.isLoading else { return false }
+            return (try await view.evaluateJavaScript("document.readyState === 'complete' && location.pathname === '\(path)' && !!document.getElementById('fixtureReady')")) as? Bool == true
+        }
     }
     func visibleState() throws -> (WebState, UIWindow) {
         let state = WebState()
@@ -92,6 +95,16 @@ import AVFoundation
         XCTAssertEqual(permission(state, view: view, origin: main.securityOrigin, frame: main), .deny)
         state.setAuthorization(true)
         XCTAssertEqual(permission(state, view: view, origin: main.securityOrigin, frame: main), expected)
+        let host = try XCTUnwrap(state.retainedHost)
+        let parent = try XCTUnwrap(host.superview)
+        host.removeFromSuperview()
+        XCTAssertEqual(permission(state, view: view, origin: main.securityOrigin, frame: main), .deny)
+        parent.addSubview(host)
+        await Task.yield()
+        XCTAssertFalse(state.mediaSuspended, "Immediate reattachment must not leave capture stopped")
+        XCTAssertEqual(permission(state, view: view, origin: main.securityOrigin, frame: main), expected)
+        let both = CaptureConsentPolicy.decision([AVCaptureDevice.authorizationStatus(for: .video), AVCaptureDevice.authorizationStatus(for: .audio)])
+        XCTAssertEqual(permission(state, view: view, origin: child.securityOrigin, frame: child, type: .cameraAndMicrophone), both)
         XCTAssertEqual(state.creationCount, 1)
         // Calls the production delegate with real HTTPS frame contexts. It does
         // not grant OS consent, obtain a camera stream or perform a facial scan.
