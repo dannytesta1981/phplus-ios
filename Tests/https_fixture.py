@@ -2,6 +2,8 @@
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import ssl
+import socket
+import re
 class Fixture(BaseHTTPRequestHandler):
     def redirect(self, destination, code=302):
         self.send_response(code)
@@ -14,12 +16,31 @@ class Fixture(BaseHTTPRequestHandler):
             return self.redirect('https://localhost:8843/scan-complete',303)
         self.send_error(404)
     def do_GET(self):
+        if self.path == '/network-error':
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
         if self.path == '/verify-start':
             return self.redirect('https://127.0.0.1:8843/verify-hop')
         if self.path == '/verify-hop':
             return self.redirect('https://localhost:8843/scan-complete')
         if self.path == '/preview.mp4':
-            body=Path('Tests/preview.mp4').read_bytes(); content='video/mp4'
+            body=Path('Tests/preview.mp4').read_bytes()
+            total=len(body)
+            match=re.fullmatch(r'bytes=(\d+)-(\d*)',self.headers.get('Range',''))
+            if match:
+                start=int(match[1]); end=min(int(match[2]) if match[2] else total-1,total-1)
+                if start>=total:
+                    self.send_error(416); return
+                body=body[start:end+1]
+                self.send_response(206)
+                self.send_header('Content-Range',f'bytes {start}-{end}/{total}')
+            else:self.send_response(200)
+            self.send_header('Accept-Ranges','bytes')
+            self.send_header('Content-Type','video/mp4')
+            self.send_header('Content-Length',str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+            return
         else:
             extra=''
             if self.path == '/capture-context':

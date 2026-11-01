@@ -42,6 +42,9 @@ import AVFoundation
         var decision: WKPermissionDecision?
         state.coordinator().webView(view, requestMediaCapturePermissionFor: origin, initiatedByFrame: frame, type: type) { decision = $0 }
         XCTAssertNotNil(decision)
+        if decision == .deny {
+            print("SYNTHETIC capture context: authorized=\(state.authorized) recovery=\(state.recoveryVisible) application=\(UIApplication.shared.applicationState.rawValue) window=\(view.window != nil) hidden=\(String(describing: view.window?.isHidden)) top=\(state.coordinator().windows.last === view) scheme=\(view.url?.scheme ?? "nil") request=\(origin.protocol):\(origin.host):\(origin.port) frame=\(frame.securityOrigin.protocol):\(frame.securityOrigin.host):\(frame.securityOrigin.port) events=\(state.events.suffix(2))")
+        }
         return decision ?? .deny
     }
     func testDeviceDenialsStillDenyAndAllOtherStatesRequireSitePrompt() {
@@ -156,7 +159,9 @@ import AVFoundation
         post.httpMethod = "POST"; post.httpBody = Data("synthetic=only".utf8)
         view.load(post)
         try await ready(view, path: "/scan-complete")
-        state.returnToPortal(); state.resumePage()
+        state.returnToPortal(); state.reloadPage()
+        XCTAssertFalse(state.recoveryVisible, "Explicit Reload must leave the native recovery panel")
+        try await ready(view, path: "/scan-complete")
         // Test-only preference permits scripted popup creation without a UI tap.
         view.configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         let opened = try await view.evaluateJavaScript("window.open('https://127.0.0.1:8843/verify-start','scanFixture') !== null") as? Bool
@@ -178,7 +183,7 @@ import AVFoundation
         defer { state.dispose(); window.isHidden = true }
         let view = try XCTUnwrap(state.view)
         try await ready(view, path: "/dashboard")
-        view.load(URLRequest(url: URL(string: "https://localhost:1/unreachable")!))
+        view.load(URLRequest(url: URL(string: "https://localhost:8843/network-error")!))
         try await waitFor { state.error != nil }
         state.returnToPortal()
         XCTAssertTrue(state.recoveryVisible)

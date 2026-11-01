@@ -285,6 +285,16 @@ struct PortalEditor: View {
         recoveryVisible = false; error = nil
         retainedCoordinator?.resumeMediaIfAllowed()
     }
+    func reloadPage() {
+        guard authorized else { return }
+        retainedCoordinator?.cancelPendingDialog()
+        view?.stopLoading(); resumePage(); view?.reload()
+    }
+    func navigateForward() {
+        guard authorized, let view = view, view.canGoForward else { return }
+        retainedCoordinator?.cancelPendingDialog()
+        view.stopLoading(); resumePage(); view.goForward()
+    }
     func returnToPortal() { coordinator().returnToPortal() }
     func navigateBack() { coordinator().navigateBack() }
 
@@ -446,10 +456,10 @@ struct PortalBrowser: View {
             }
             ToolbarItemGroup(placement: .bottomBar) {
                 Button { state.navigateBack() } label: { Image(systemName: "chevron.left") }.accessibilityLabel("Indietro")
-                Button { state.view?.goForward() } label: { Image(systemName: "chevron.right") }.accessibilityLabel("Avanti")
+                Button { state.navigateForward() } label: { Image(systemName: "chevron.right") }.accessibilityLabel("Avanti")
                 Spacer()
                 Button { state.openEntry() } label: { Image(systemName: "house") }.accessibilityLabel("Pagina iniziale")
-                Button { state.error = nil; state.view?.reload() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Ricarica")
+                Button { state.reloadPage() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Ricarica")
             }
         }
         .sheet(isPresented: $ageKey, onDismiss: {
@@ -689,7 +699,7 @@ struct BrowserView: UIViewRepresentable {
         }
         func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
             guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: state.authorized && !state.recoveryVisible && UIApplication.shared.applicationState == .active), windows.last === webView, webView.window?.isHidden == false else {
-                state.record("PERMESSO NEGATO", "Origine non HTTPS, frame incoerente o pagina non attiva")
+                state.record("PERMESSO NEGATO", "Contesto: sbloccato=\(state.authorized), recupero=\(state.recoveryVisible), app attiva=\(UIApplication.shared.applicationState == .active), finestra presente=\(webView.window != nil), visibile=\(webView.window?.isHidden == false), primo piano=\(windows.last === webView), pagina HTTPS=\(webView.url?.scheme?.lowercased() == "https"), origine/frame=\(origin.protocol == frame.securityOrigin.protocol && origin.host == frame.securityOrigin.host && origin.port == frame.securityOrigin.port)")
                 decisionHandler(.deny); return
             }
             let camera: Bool
