@@ -408,6 +408,7 @@ struct PortalBrowser: View {
                 }.font(.footnote).padding(8)
             }
             if let message = state.error { Text(message).font(.footnote).padding().accessibilityIdentifier("webError") }
+            if let status = browser.status { Text(status).font(.footnote).padding(8) }
             ZStack {
                 if let url = URL(string: portal.url) { BrowserView(url: url, state: state) }
                 if state.recoveryVisible {
@@ -550,7 +551,7 @@ struct BrowserView: UIViewRepresentable {
             } else { returnToPortal() }
         }
         func resumeMediaIfAllowed() {
-            guard state.authorized, !state.systemBrowser.active, UIApplication.shared.applicationState == .active, host?.window != nil else { return }
+            guard state.authorized, !state.recoveryVisible, !state.systemBrowser.active, UIApplication.shared.applicationState == .active, host?.window != nil else { return }
             state.mediaSuspended = false
             for view in windows { view.setAllMediaPlaybackSuspended(false, completionHandler: nil) }
         }
@@ -615,7 +616,7 @@ struct BrowserView: UIViewRepresentable {
         }
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { state.error = "Pagina interrotta. Premi Ricarica per riprovare."; state.record("WEBKIT", "Processo della pagina terminato") }
         func presenter(for webView: WKWebView) -> UIViewController? {
-            guard state.authorized, UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
+            guard state.authorized, !state.recoveryVisible, UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
             var top = root
             while let next = top.presentedViewController { top = next }
             return top.presentedViewController == nil && !top.isBeingDismissed ? top : nil
@@ -660,7 +661,7 @@ struct BrowserView: UIViewRepresentable {
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-            guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: state.authorized && UIApplication.shared.applicationState == .active), windows.last === webView, webView.window != nil else {
+            guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: state.authorized && !state.recoveryVisible && UIApplication.shared.applicationState == .active), windows.last === webView, webView.window != nil else {
                 state.record("PERMESSO NEGATO", "Origine non HTTPS, frame incoerente o pagina non attiva")
                 decisionHandler(.deny); return
             }

@@ -159,6 +159,10 @@ import WebKit
         XCTAssertEqual(coordinator.windows.count, 1)
         state.navigateBack() // Native action remains callable after popup close/cancel.
         XCTAssertTrue(state.view === view)
+        state.recoveryVisible = true
+        coordinator.suspendCapture()
+        state.setAuthorization(false); state.setAuthorization(true)
+        XCTAssertTrue(state.mediaSuspended, "Recovery overlay must not allow media to resume on unlock")
     }
     func testWriteWebStorageAndObserveCameraAPIOnHTTPS() async throws {
         let state = makeFixtureState(); defer { state.dispose() }
