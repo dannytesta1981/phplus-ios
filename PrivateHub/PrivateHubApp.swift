@@ -488,6 +488,7 @@ struct BrowserView: UIViewRepresentable {
         weak var host: UIView?
         var windows: [WKWebView] = []
         var portalItem: WKBackForwardListItem?
+        var embeddedProvider = false
         private var cancelDialog: (() -> Void)?
         private weak var dialog: UIAlertController?
         func cancelPendingDialog() {
@@ -530,6 +531,9 @@ struct BrowserView: UIViewRepresentable {
             stopForRecovery()
             state.error = nil
             guard let root = windows.first else { state.recoveryVisible = true; return }
+            // A provider iframe can have no back-stack entry. Do not pretend that
+            // closing a popup or showing its parent cancels that embedded flow.
+            if embeddedProvider { state.recoveryVisible = true; return }
             if let current = root.url, let entry = state.entry,
                RestorationPolicy.restorable(current, entry: entry, method: state.navigationMethods[ObjectIdentifier(root)] ?? "GET") != nil {
                 state.recoveryVisible = false // Already on the portal: no load().
@@ -584,7 +588,7 @@ struct BrowserView: UIViewRepresentable {
             state.closePopup = nil
             state.view = nil
         }
-        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { state.error = nil; state.restoreCandidates.removeValue(forKey: ObjectIdentifier(webView)); state.onCheckpoint?(nil, nil); state.record("NAVIGAZIONE", "Caricamento iniziato") }
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { if webView === windows.first { embeddedProvider = false }; state.error = nil; state.restoreCandidates.removeValue(forKey: ObjectIdentifier(webView)); state.onCheckpoint?(nil, nil); state.record("NAVIGAZIONE", "Caricamento iniziato") }
         func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) { state.record("REDIRECT", "Reindirizzamento del sito; archivio cookie persistente invariato") }
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             state.record("NAVIGAZIONE", "Documento caricato")
@@ -616,7 +620,7 @@ struct BrowserView: UIViewRepresentable {
         }
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { state.error = "Pagina interrotta. Premi Ricarica per riprovare."; state.record("WEBKIT", "Processo della pagina terminato") }
         func presenter(for webView: WKWebView) -> UIViewController? {
-            guard state.authorized, !state.recoveryVisible, UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
+            guard state.authorized, !state.recoveryVisible, !state.cancellingVerification, UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
             var top = root
             while let next = top.presentedViewController { top = next }
             return top.presentedViewController == nil && !top.isBeingDismissed ? top : nil
@@ -631,6 +635,7 @@ struct BrowserView: UIViewRepresentable {
             }
             dialog = alert; cancelDialog = finish
             alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in finish() })
+            alert.addAction(UIAlertAction(title: "Torna al portale", style: .destructive) { [weak self] _ in self?.returnToPortal() })
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
@@ -644,6 +649,7 @@ struct BrowserView: UIViewRepresentable {
             dialog = alert; cancelDialog = { finish(false) }
             alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in finish(false) })
             alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in finish(true) })
+            alert.addAction(UIAlertAction(title: "Torna al portale", style: .destructive) { [weak self] _ in self?.returnToPortal() })
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
@@ -658,6 +664,7 @@ struct BrowserView: UIViewRepresentable {
             alert.addTextField { $0.text = defaultText }
             alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in finish(nil) })
             alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in finish(alert.textFields?.first?.text) })
+            alert.addAction(UIAlertAction(title: "Torna al portale", style: .destructive) { [weak self] _ in self?.returnToPortal() })
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
@@ -692,6 +699,7 @@ struct BrowserView: UIViewRepresentable {
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             guard permitsRecoveryNavigation(navigationAction.request.url) else { decisionHandler(.cancel); return }
             if SystemBrowserPolicy.isAgeProvider(navigationAction.request.url) {
+                if webView === windows.first, navigationAction.targetFrame?.isMainFrame == false { embeddedProvider = true }
                 state.ageKeyDetected = true
                 state.record("AGEKEY", "Origine AgeKey/OpenAge rilevata. Il browser di sistema usa l’ingresso originale del portale, senza leggere o trasferire token della verifica")
             }
@@ -708,6 +716,7 @@ struct BrowserView: UIViewRepresentable {
             decisionHandler(.allow)
         }
         func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+            if webView === windows.first, !navigationResponse.isForMainFrame, SystemBrowserPolicy.isAgeProvider(navigationResponse.response.url) { embeddedProvider = true; state.ageKeyDetected = true }
             guard permitsRecoveryNavigation(navigationResponse.response.url) else { decisionHandler(.cancel); return }
             if let response = navigationResponse.response as? HTTPURLResponse, response.statusCode >= 400 {
                 state.record("RISPOSTA SITO", "HTTP \(response.statusCode). Possibile rifiuto del servizio; non dimostra da solo un limite della WebView")

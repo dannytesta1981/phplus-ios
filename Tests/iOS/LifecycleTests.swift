@@ -141,6 +141,13 @@ import WebKit
         state.returnToPortal() // Already on the portal must not reload it.
         let marker = try await view.evaluateJavaScript("window.fixtureVolatile") as? String
         XCTAssertEqual(marker, "no-reload")
+        coordinator.embeddedProvider = true
+        state.returnToPortal()
+        XCTAssertTrue(state.recoveryVisible, "An iframe with no history must offer native recovery")
+        XCTAssertTrue(state.view === view)
+        let retained = try await view.evaluateJavaScript("window.fixtureVolatile") as? String
+        XCTAssertEqual(retained, "no-reload")
+        coordinator.embeddedProvider = false; state.recoveryVisible = false
         state.cancellingVerification = false
         view.load(URLRequest(url: URL(string: "https://localhost:8843/provider-error")!))
         try await ready(view, path: "/provider-error")
