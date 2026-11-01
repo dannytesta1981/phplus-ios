@@ -149,7 +149,7 @@ import WebKit
         return localStorage.getItem('phplus_fixture');
         """, arguments: [:], in: nil, contentWorld: .page)
         XCTAssertEqual(result as? String, "ok")
-        let cookies = await view.configuration.websiteDataStore.httpCookieStore.allCookies()
+        let cookies = await view.configuration.websiteDataStore.httpCookieStore.phplusCookieSnapshot()
         XCTAssertTrue(cookies.contains { $0.name == "phplus_fixture" && !$0.isSessionOnly })
         UserDefaults.standard.set(true, forKey: "phplus.tests.fixtureWasWritten")
         let observed = expectation(description: "Cookie and web-data checkpoint")

@@ -323,7 +323,7 @@ struct PortalEditor: View {
             defer { task.finish() }
             guard let self = self, let view = view else { return }
             let inspectedURL = view.url
-            let cookies = await view.configuration.websiteDataStore.httpCookieStore.allCookies()
+            let cookies = await view.configuration.websiteDataStore.httpCookieStore.phplusCookieSnapshot()
             guard view.url == inspectedURL else { return }
             let host = inspectedURL?.host?.lowercased() ?? ""
             let relevant = cookies.filter { cookie in let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")); return host == domain || host.hasSuffix("." + domain) }
@@ -360,6 +360,8 @@ struct PortalEditor: View {
 }
 
 struct PortalBrowser: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var security: SecurityController
     let portal: Portal
     @ObservedObject var state: WebState
     @State private var diagnostics = false
@@ -370,6 +372,8 @@ struct PortalBrowser: View {
             if let url = URL(string: portal.url) { BrowserView(url: url, state: state) }
         }
         .onDisappear { state.retainedCoordinator?.suspendCapture() }
+        .onChange(of: scenePhase) { _, phase in if phase == .background { diagnostics = false; safari = false } }
+        .onChange(of: security.unlocked) { _, unlocked in if !unlocked { diagnostics = false; safari = false } }
         .navigationTitle(portal.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -428,6 +432,13 @@ struct BrowserView: UIViewRepresentable {
         let state: WebState
         weak var host: UIView?
         var windows: [WKWebView] = []
+        private var cancelDialog: (() -> Void)?
+        private weak var dialog: UIAlertController?
+        func cancelPendingDialog() {
+            dialog?.dismiss(animated: false)
+            cancelDialog?()
+            cancelDialog = nil; dialog = nil
+        }
         init(state: WebState) { self.state = state }
         func attach(_ webView: WKWebView, to host: UIView) {
             self.host = host
@@ -452,12 +463,14 @@ struct BrowserView: UIViewRepresentable {
             state.record("POPUP", "Finestra chiusa; sessione del sito conservata")
         }
         func suspendCapture() {
+            cancelPendingDialog()
             for view in windows {
                 view.setCameraCaptureState(.none, completionHandler: nil)
                 view.setMicrophoneCaptureState(.none, completionHandler: nil)
             }
         }
         func cleanup() {
+            cancelPendingDialog()
             for view in windows {
                 view.stopLoading()
                 view.setCameraCaptureState(.none, completionHandler: nil)
@@ -497,7 +510,7 @@ struct BrowserView: UIViewRepresentable {
         }
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { state.error = "Pagina interrotta. Premi Ricarica per riprovare."; state.record("WEBKIT", "Processo della pagina terminato") }
         func presenter(for webView: WKWebView) -> UIViewController? {
-            guard UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
+            guard state.authorized, UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
             var top = root
             while let next = top.presentedViewController { top = next }
             return top.presentedViewController == nil && !top.isBeingDismissed ? top : nil
@@ -505,22 +518,40 @@ struct BrowserView: UIViewRepresentable {
         func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
             guard let top = presenter(for: webView) else { completionHandler(); return }
             let alert = UIAlertController(title: "Messaggio del sito", message: message, preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
+            var resolved = false
+            let finish: () -> Void = { [weak self] in
+                guard !resolved else { return }; resolved = true
+                self?.cancelDialog = nil; self?.dialog = nil; completionHandler()
+            }
+            dialog = alert; cancelDialog = finish
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in finish() })
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
             guard let top = presenter(for: webView) else { completionHandler(false); return }
             let alert = UIAlertController(title: "Conferma del sito", message: message, preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in completionHandler(false) })
-            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
+            var resolved = false
+            let finish: (Bool) -> Void = { [weak self] result in
+                guard !resolved else { return }; resolved = true
+                self?.cancelDialog = nil; self?.dialog = nil; completionHandler(result)
+            }
+            dialog = alert; cancelDialog = { finish(false) }
+            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in finish(false) })
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in finish(true) })
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
             guard let top = presenter(for: webView) else { completionHandler(nil); return }
             let alert = UIAlertController(title: "Richiesta del sito", message: prompt, preferredStyle: .alert)
+            var resolved = false
+            let finish: (String?) -> Void = { [weak self] result in
+                guard !resolved else { return }; resolved = true
+                self?.cancelDialog = nil; self?.dialog = nil; completionHandler(result)
+            }
+            dialog = alert; cancelDialog = { finish(nil) }
             alert.addTextField { $0.text = defaultText }
-            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in completionHandler(nil) })
-            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(alert.textFields?.first?.text) })
+            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in finish(nil) })
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in finish(alert.textFields?.first?.text) })
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {

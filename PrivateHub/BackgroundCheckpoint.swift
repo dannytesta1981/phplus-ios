@@ -15,7 +15,7 @@ import WebKit
     }
 }
 extension WKHTTPCookieStore {
-    @MainActor func allCookies() async -> [HTTPCookie] {
+    @MainActor func phplusCookieSnapshot() async -> [HTTPCookie] {
         await withCheckedContinuation { continuation in getAllCookies { continuation.resume(returning: $0) } }
     }
 }
