@@ -1,8 +1,7 @@
 import SwiftUI
-import AuthenticationServices
 
-// No verification URL or token is decoded, rewritten, persisted or returned to WKWebView.
-// A third-party portal owns its redirect contract; we cannot invent an OIDC callback.
+// The configured portal, never a captured verification URL, is handed to the
+// user's actual default browser. No callback, cookie or verification result is read.
 enum SystemBrowserPolicy {
     static func entry(_ url: URL?) -> URL? {
         guard let url = url, let c = URLComponents(url: url, resolvingAgainstBaseURL: false), c.scheme?.lowercased() == "https", let host = c.host, !host.isEmpty, c.user == nil, c.password == nil else { return nil }
@@ -14,71 +13,30 @@ enum SystemBrowserPolicy {
     }
 }
 
-@MainActor protocol BrowserAuthenticationSession: AnyObject {
-    var prefersEphemeralWebBrowserSession: Bool { get set }
-    var presentationContextProvider: ASWebAuthenticationPresentationContextProviding? { get set }
-    func start() -> Bool
-    func cancel()
-}
-extension ASWebAuthenticationSession: BrowserAuthenticationSession {}
-
-@MainActor final class SystemBrowserController: NSObject, ObservableObject, ASWebAuthenticationPresentationContextProviding {
-    typealias Factory = (URL, @escaping (URL?, Error?) -> Void) -> BrowserAuthenticationSession
+@MainActor final class SystemBrowserController: ObservableObject {
+    typealias Opener = (URL, @escaping (Bool) -> Void) -> Void
     @Published private(set) var active = false
     @Published private(set) var status: String?
-    private var session: BrowserAuthenticationSession?
-    private var anchor: ASPresentationAnchor?
-    private var generation = 0
-    private let factory: Factory
-    init(factory: Factory? = nil) {
-        self.factory = factory ?? { url, completion in
-            // nil is deliberate: this generic browser does not own/register the
-            // portal's redirect URI. The official portal flow stays in this browser.
-            ASWebAuthenticationSession(url: url, callbackURLScheme: nil, completionHandler: completion)
-        }
-        super.init()
-        NotificationCenter.default.addObserver(self, selector: #selector(backgrounded), name: UIApplication.didEnterBackgroundNotification, object: nil)
+    private let opener: Opener
+    init(opener: Opener? = nil) {
+        self.opener = opener ?? { url, completion in UIApplication.shared.open(url, options: [:], completionHandler: completion) }
     }
-    func open(portal: URL?, anchor: ASPresentationAnchor) {
+    func open(portal: URL?) {
         guard !active else { return }
         guard let url = SystemBrowserPolicy.entry(portal) else {
-            status = "Ingresso HTTPS del portale non valido. Nessun flusso è stato aperto."; return
+            status = "Ingresso HTTPS non valido. Nessun browser aperto."; return
         }
-        generation += 1
-        let attempt = generation
-        let created = factory(url) { [weak self] _, error in
-            // Intentionally ignore callback URLs. Never infer PASS from a URL,
-            // and never copy credentials or cookies to the embedded browser.
+        active = true
+        opener(url) { [weak self] opened in
             Task { @MainActor in
-                guard let self = self, self.generation == attempt else { return }
-                self.session = nil; self.anchor = nil; self.active = false
-                let nsError = error as NSError?
-                let cancelled = nsError?.domain == ASWebAuthenticationSessionErrorDomain && nsError?.code == ASWebAuthenticationSessionError.Code.canceledLogin.rawValue
-                self.status = cancelled || error == nil ? "Browser di sistema chiuso. La WebView è invariata; nessun esito o cookie è stato trasferito." : "Il browser di sistema non ha completato l’apertura. Puoi continuare con Face Scan nella WebView o usare Safari."
+                self?.active = false
+                self?.status = opened ? "Richiesta di apertura accettata da iOS. Non è un esito di verifica. Continua nel browser esterno; la WebView conserva la propria sessione separata." : "Browser esterno non aperto. La pagina in phplus è conservata; puoi riprovare o usare Face Scan."
             }
         }
-        self.anchor = anchor
-        created.presentationContextProvider = self
-        created.prefersEphemeralWebBrowserSession = false
-        session = created; active = true; status = nil
-        if !created.start() {
-            generation += 1; session = nil; self.anchor = nil; active = false
-            status = "Impossibile avviare il browser di sistema. Face Scan nella WebView resta disponibile."
-        }
     }
-    func close() {
-        generation += 1
-        let old = session
-        session = nil; anchor = nil; active = false
-        old?.cancel()
-        status = "Browser di sistema chiuso; pagina e dati della WebView conservati."
-    }
-    @objc func backgrounded() {
-        guard active else { return }
-        close()
-        status = "Browser di sistema chiuso in background per interrompere eventuali attività. Le credenziali restano gestite da iOS e dal servizio."
-    }
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor { anchor ?? ASPresentationAnchor() }
+    // External tabs belong to the browser: phplus cannot close or privatize them.
+    func close() {}
+    func backgrounded() {}
 }
 
 struct AgeKeyBrowserHelp: View {
@@ -88,21 +46,22 @@ struct AgeKeyBrowserHelp: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("AgeKey e passkey") {
-                    Text("Apri l’intero portale nel browser di autenticazione di iOS, senza modalità privata richiesta dall’app. Nel sito scegli AgeKey esistente, oppure creane una con il suo flusso ufficiale. iOS e il servizio gestiscono la credenziale.")
-                    Text("Potrebbe essere necessario accedere di nuovo. Cookie e login del browser di sistema non vengono copiati nella WebView.")
+                Section("AgeKey nel browser esterno") {
+                    Text("Apri il portale dall’inizio nel browser predefinito di iOS (Safari se impostato). Completa lì accesso, AgeKey e ritorno al portale, mantenendo tutto il percorso nello stesso browser. Non viene inoltrato l’URL temporaneo di verifica.")
+                    Text("Usa una scheda normale per conservare i dati che il servizio consente. Il gestore credenziali di iOS e il sito decidono se la AgeKey esistente può essere riutilizzata. Face Scan resta disponibile in phplus.")
                 }
-                Section("Ritorno al sito") {
-                    Text("Completa verifica e ritorno al portale nella stessa finestra di sistema. Quando la chiudi ritrovi la WebView precedente, senza trasferimenti automatici della verifica. Un ritorno nativo trasparente richiede la collaborazione del sito e un callback registrato.")
-                    Text("Face Scan rimane disponibile nella WebView. Se passi a un’altra app, la finestra di sistema viene chiusa per proteggere la privacy; il servizio potrebbe richiedere di ripartire.")
+                Section("Sessioni e ritorno") {
+                    Text("Cookie e verifica del browser esterno non vengono trasferiti alla WebView. Tornando a phplus ritrovi la sua pagina precedente, che potrebbe richiedere ancora la verifica. Non è previsto un ritorno automatico registrato per questi portali.")
+                }
+                Section("Privacy fuori da phplus") {
+                    Text("Face ID protegge l’accesso a phplus, non Safari o altri browser. Anteprime, cronologia, sincronizzazione, cookie, schede e attività multimediali esterne sono controllati dal browser. phplus non può oscurarli, fermarli o chiuderli. Usa le protezioni e i comandi del browser.")
                 }
                 Section {
-                    Button("Apri portale nel browser di sistema") { dismiss(); start() }.disabled(browser.active)
-                    if browser.active { Button("Chiudi browser di sistema") { browser.close() } }
+                    Button("Apri intero portale nel browser esterno") { dismiss(); start() }.disabled(browser.active)
                     if let status = browser.status { Text(status).font(.footnote) }
                 }
             }
-            .navigationTitle("AgeKey")
+            .navigationTitle("AgeKey esterna")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Chiudi") { dismiss() } } }
         }
     }

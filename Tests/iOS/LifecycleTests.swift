@@ -133,6 +133,33 @@ import WebKit
         let after = try await view.evaluateJavaScript("window.scrollY") as? Double
         XCTAssertEqual(before, after)
     }
+    func testRecoveryReturnsToRetainedPortalAndClosesProviderPopup() async throws {
+        let state = makeFixtureState(); defer { state.dispose() }
+        let view = try XCTUnwrap(state.view); try await ready(view)
+        let coordinator = state.coordinator()
+        _ = try await view.evaluateJavaScript("window.fixtureVolatile = 'no-reload'; document.cookie = 'recovery=ok; Path=/; Secure'")
+        state.returnToPortal() // Already on the portal must not reload it.
+        let marker = try await view.evaluateJavaScript("window.fixtureVolatile") as? String
+        XCTAssertEqual(marker, "no-reload")
+        state.cancellingVerification = false
+        view.load(URLRequest(url: URL(string: "https://localhost:8843/provider-error")!))
+        try await ready(view, path: "/provider-error")
+        XCTAssertNotNil(coordinator.portalItem)
+        state.returnToPortal()
+        try await ready(view)
+        XCTAssertFalse(state.recoveryVisible)
+        XCTAssertTrue(state.view === view)
+        let cookie = try await view.evaluateJavaScript("document.cookie.includes('recovery=ok')") as? Bool
+        XCTAssertEqual(cookie, true)
+        let popup = WKWebView(frame: .zero, configuration: view.configuration)
+        coordinator.attach(popup, to: try XCTUnwrap(state.retainedHost))
+        XCTAssertTrue(state.hasPopup)
+        state.returnToPortal()
+        XCTAssertFalse(state.hasPopup); XCTAssertTrue(state.view === view)
+        XCTAssertEqual(coordinator.windows.count, 1)
+        state.navigateBack() // Native action remains callable after popup close/cancel.
+        XCTAssertTrue(state.view === view)
+    }
     func testWriteWebStorageAndObserveCameraAPIOnHTTPS() async throws {
         let state = makeFixtureState(); defer { state.dispose() }
         let view = try XCTUnwrap(state.view); try await ready(view)

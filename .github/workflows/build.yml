@@ -30,7 +30,7 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/phplus.app dist/Payload/
           APP=dist/Payload/phplus.app
           test "$(lipo -archs "$APP/phplus")" = arm64
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = 1.3
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = 1.3.1
           /usr/libexec/PlistBuddy -c 'Print :NSFaceIDUsageDescription' "$APP/Info.plist"
           test -n "$(/usr/libexec/PlistBuddy -c 'Print :NSCameraUsageDescription' "$APP/Info.plist")"
           test -n "$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Info.plist")"
@@ -39,21 +39,20 @@ jobs:
           if /usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' "$APP/Info.plist"; then exit 1; fi
           strings "$APP/phplus" > dist/binary-strings.txt
           grep -q 'requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:' dist/binary-strings.txt
-          grep -q 'setPrefersEphemeralWebBrowserSession:' dist/binary-strings.txt
           grep -q 'setAllowsPictureInPictureMediaPlayback:' dist/binary-strings.txt
           xcrun vtool -show-build "$APP/phplus" | tee dist/verification.txt
           grep -q 'platform IOS' dist/verification.txt
           cd dist
-          zip -qry phplus-1.3-unsigned.ipa Payload
-          unzip -t phplus-1.3-unsigned.ipa
-          shasum -a 256 phplus-1.3-unsigned.ipa > SHA256SUMS.txt
+          zip -qry phplus-1.3.1-unsigned.ipa Payload
+          unzip -t phplus-1.3.1-unsigned.ipa
+          shasum -a 256 phplus-1.3.1-unsigned.ipa > SHA256SUMS.txt
           cd ..
-          zip -qry dist/phplus-1.3-source.zip PrivateHub phplus.xcodeproj project.yml README.md .github Tests
+          zip -qry dist/phplus-1.3.1-source.zip PrivateHub phplus.xcodeproj project.yml README.md .github Tests
       - name: Real WebKit and lifecycle tests on iOS 18.5 simulator
         timeout-minutes: 15
         run: |
           set -o pipefail
-          DEVICE=$(xcrun simctl create phplus-1-3-tests com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro com.apple.CoreSimulator.SimRuntime.iOS-18-5)
+          DEVICE=$(xcrun simctl create phplus-1-3-1-tests com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro com.apple.CoreSimulator.SimRuntime.iOS-18-5)
           echo "$DEVICE" > /tmp/phplus-simulator-id
           xcrun simctl boot "$DEVICE"
           xcrun simctl bootstatus "$DEVICE" -b
@@ -66,10 +65,10 @@ jobs:
           printf 'Simulator: iPhone 16 Pro, iOS 18.5. Two separate XCTest host processes. Simulator-only minimum deployment target 18.4 for WebKit bug 293831; device IPA remains iOS 17+. Physical Face ID/camera and provider identity acceptance: NOT TESTED.\n' > dist/test-scope.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: phplus-1.3
+          name: phplus-1.3.1
           path: |
-            dist/phplus-1.3-unsigned.ipa
-            dist/phplus-1.3-source.zip
+            dist/phplus-1.3.1-unsigned.ipa
+            dist/phplus-1.3.1-source.zip
             dist/verification.txt
             dist/SHA256SUMS.txt
             dist/test-scope.txt

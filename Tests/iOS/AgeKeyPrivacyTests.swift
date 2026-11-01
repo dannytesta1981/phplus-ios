@@ -3,52 +3,48 @@ import WebKit
 import AuthenticationServices
 @testable import phplus
 
-@MainActor final class MockBrowserSession: BrowserAuthenticationSession {
-    var prefersEphemeralWebBrowserSession = true
-    weak var presentationContextProvider: ASWebAuthenticationPresentationContextProviding?
-    var starts = 0
-    var cancels = 0
-    var startsSuccessfully = true
-    func start() -> Bool { starts += 1; return startsSuccessfully }
-    func cancel() { cancels += 1 }
-}
 @MainActor final class AgeKeyPrivacyTests: XCTestCase {
-    func testSystemBrowserIsNonEphemeralAndUsesUnmodifiedPortalEntry() {
-        let mock = MockBrowserSession()
+    func testExternalOpeningUsesOnlyOriginalPortalAndNeverClaimsVerification() async {
         var received: URL?
-        let controller = SystemBrowserController { url, _ in received = url; return mock }
+        var completion: ((Bool) -> Void)?
+        var opens = 0
+        let controller = SystemBrowserController { url, done in received = url; completion = done; opens += 1 }
         let entry = URL(string: "https://portal.invalid/dashboard")!
-        controller.open(portal: entry, anchor: UIWindow())
-        XCTAssertEqual(received, entry)
-        XCTAssertFalse(mock.prefersEphemeralWebBrowserSession)
-        XCTAssertTrue(controller.active)
-        XCTAssertTrue(mock.presentationContextProvider === controller)
-        controller.open(portal: entry, anchor: UIWindow())
-        XCTAssertEqual(mock.starts, 1)
-        controller.close(); XCTAssertEqual(mock.cancels, 1)
+        controller.open(portal: entry)
+        controller.open(portal: entry)
+        XCTAssertEqual(received, entry); XCTAssertEqual(opens, 1)
+        controller.backgrounded() // External tabs are not cancelled on app background.
+        completion?(true)
+        await Task.yield(); await Task.yield()
         XCTAssertFalse(controller.active)
+        XCTAssertTrue(controller.status?.contains("Non è un esito di verifica") ?? false)
         XCTAssertNil(SystemBrowserPolicy.entry(URL(string: "http://portal.invalid")))
         XCTAssertNil(SystemBrowserPolicy.entry(URL(string: "https://user:secret@portal.invalid")))
         XCTAssertTrue(SystemBrowserPolicy.isAgeProvider(URL(string: "https://ui.prod.ageapi.org/verify")))
         XCTAssertFalse(SystemBrowserPolicy.isAgeProvider(URL(string: "https://ui.prod.ageapi.org.attacker.invalid/verify")))
-        XCTAssertFalse(SystemBrowserPolicy.isAgeProvider(URL(string: "http://ui.prod.ageapi.org/verify")))
     }
-    func testBrowserClosesOnBackgroundAndNeverTreatsCallbackAsVerified() async {
-        let mock = MockBrowserSession()
-        var callback: ((URL?, Error?) -> Void)?
-        let controller = SystemBrowserController { _, completion in callback = completion; return mock }
-        controller.open(portal: URL(string: "https://portal.invalid"), anchor: UIWindow())
-        controller.backgrounded()
-        XCTAssertFalse(controller.active); XCTAssertEqual(mock.cancels, 1)
-        let status = controller.status
-        callback?(URL(string: "phplus://callback?token=SYNTHETIC_PRIVATE&result=PASS"), nil)
-        await Task.yield()
-        XCTAssertEqual(controller.status, status, "Stale callbacks cannot report verification or change a later session")
-        XCTAssertFalse(controller.status?.contains("SYNTHETIC_PRIVATE") ?? true)
-        let failure = MockBrowserSession(); failure.startsSuccessfully = false
-        let failing = SystemBrowserController { _, _ in failure }
-        failing.open(portal: URL(string: "https://portal.invalid"), anchor: UIWindow())
-        XCTAssertFalse(failing.active); XCTAssertNotNil(failing.status)
+    func testFailedExternalOpeningLeavesExplicitRecoveryStatus() async {
+        let controller = SystemBrowserController { _, done in done(false) }
+        controller.open(portal: URL(string: "https://portal.invalid"))
+        await Task.yield(); await Task.yield()
+        XCTAssertFalse(controller.active)
+        XCTAssertTrue(controller.status?.contains("non aperto") ?? false)
+    }
+    func testCancelledVerificationStopsProviderLoopsButRetryIsExplicit() {
+        let state = WebState(); defer { state.dispose() }
+        let entry = URL(string: "https://portal.invalid/dashboard")!
+        _ = state.prepareHost(url: entry)
+        let original = state.view
+        state.returnToPortal()
+        XCTAssertTrue(state.recoveryVisible)
+        XCTAssertTrue(state.cancellingVerification)
+        XCTAssertFalse(state.coordinator().permitsRecoveryNavigation(URL(string: "https://ui.prod.ageapi.org/verify")))
+        XCTAssertTrue(state.coordinator().permitsRecoveryNavigation(entry))
+        state.setAuthorization(true); state.openEntry()
+        XCTAssertFalse(state.cancellingVerification); XCTAssertFalse(state.recoveryVisible)
+        XCTAssertTrue(state.coordinator().permitsRecoveryNavigation(URL(string: "https://ui.prod.ageapi.org/verify")))
+        XCTAssertTrue(state.view === original)
+        XCTAssertTrue(state.view!.configuration.websiteDataStore.isPersistent)
     }
     func testNeutralCurtainCoversEntireApplicationScene() throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)

@@ -241,6 +241,8 @@ struct PortalEditor: View {
     @Published var events: [String] = []
     @Published var hasPopup = false
     @Published var ageKeyDetected = false
+    @Published var recoveryVisible = false
+    var cancellingVerification = false
     let systemBrowser = SystemBrowserController()
     var mediaSuspended = false
     var closePopup: (() -> Void)?
@@ -271,11 +273,18 @@ struct PortalEditor: View {
         view.load(URLRequest(url: url))
     }
     func openEntry() {
-        guard authorized, let entry = entry, let view = view else { return }
+        guard authorized else { return }
+        cancellingVerification = false; recoveryVisible = false
+        let coordinator = coordinator()
+        coordinator.stopForRecovery()
+        guard let entry = entry, let view = coordinator.windows.first else { return }
         initialLoadCount = max(initialLoadCount, 1)
         error = nil
         view.load(URLRequest(url: entry))
     }
+    func returnToPortal() { coordinator().returnToPortal() }
+    func navigateBack() { coordinator().navigateBack() }
+
     func coordinator() -> BrowserView.Coordinator {
         if let value = retainedCoordinator { return value }
         let value = BrowserView.Coordinator(state: self)
@@ -371,6 +380,7 @@ struct PortalEditor: View {
 
 struct PortalBrowser: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var security: SecurityController
     let portal: Portal
     @ObservedObject var state: WebState
@@ -382,19 +392,38 @@ struct PortalBrowser: View {
     }
     @State private var startSystemBrowser = false
     @State private var diagnostics = false
-    @State private var safari = false
     @State private var ageKey = false
     var body: some View {
         VStack(spacing: 0) {
+            HStack {
+                Button("Torna al portale") { state.returnToPortal() }.accessibilityIdentifier("returnToPortal")
+                Spacer()
+                Button("Chiudi") { state.returnToPortal(); dismiss() }
+            }.padding(10)
             if state.ageKeyDetected {
-                Button("AgeKey: continua nel browser di sistema") { ageKey = true }.font(.footnote).padding(8)
+                HStack {
+                    Button("Annulla verifica / altri metodi") { state.navigateBack() }
+                    Spacer()
+                    Button("AgeKey esterna") { ageKey = true }
+                }.font(.footnote).padding(8)
             }
             if let message = state.error { Text(message).font(.footnote).padding().accessibilityIdentifier("webError") }
-            if let url = URL(string: portal.url) { BrowserView(url: url, state: state) }
+            ZStack {
+                if let url = URL(string: portal.url) { BrowserView(url: url, state: state) }
+                if state.recoveryVisible {
+                    VStack(spacing: 18) {
+                        Text("Verifica annullata").font(.headline)
+                        Text("La pagina del portale non è recuperabile senza un nuovo caricamento, oppure il sito richiede ancora la verifica. Cookie e sessione sono conservati. Nessuna verifica è stata dichiarata riuscita.")
+                        Button("Riapri portale / scegli metodo sul sito") { state.openEntry() }
+                        Button("Usa il portale nel browser esterno") { ageKey = true }
+                        Text("Se il sito non ripropone i metodi, usa i suoi comandi per scegliere Face Scan. phplus non può modificare l’esito o lo stato della verifica.").font(.footnote)
+                    }.padding().frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(uiColor: .systemBackground))
+                }
+            }
         }
         .onDisappear { state.retainedCoordinator?.suspendCapture() }
-        .onChange(of: scenePhase) { _, phase in if phase == .background { diagnostics = false; safari = false; startSystemBrowser = false; ageKey = false } }
-        .onChange(of: security.unlocked) { _, unlocked in if !unlocked { diagnostics = false; safari = false; startSystemBrowser = false; ageKey = false } }
+        .onChange(of: scenePhase) { _, phase in if phase == .background { diagnostics = false; startSystemBrowser = false; ageKey = false } }
+        .onChange(of: security.unlocked) { _, unlocked in if !unlocked { diagnostics = false; startSystemBrowser = false; ageKey = false } }
         .navigationTitle(portal.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -402,12 +431,11 @@ struct PortalBrowser: View {
                 Menu {
                     Button("Diagnostica", systemImage: "stethoscope") { state.captureStatus(); state.inspectPasskeyAvailability(); diagnostics = true }
                     Button("AgeKey / browser di sistema", systemImage: "key") { ageKey = true }
-                    Button("Apri in Safari", systemImage: "safari") { safari = true }
                     if state.hasPopup { Button("Chiudi finestra del sito", systemImage: "xmark") { state.closePopup?() } }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
             ToolbarItemGroup(placement: .bottomBar) {
-                Button { state.view?.goBack() } label: { Image(systemName: "chevron.left") }.accessibilityLabel("Indietro")
+                Button { state.navigateBack() } label: { Image(systemName: "chevron.left") }.accessibilityLabel("Indietro")
                 Button { state.view?.goForward() } label: { Image(systemName: "chevron.right") }.accessibilityLabel("Avanti")
                 Spacer()
                 Button { state.openEntry() } label: { Image(systemName: "house") }.accessibilityLabel("Pagina iniziale")
@@ -417,10 +445,10 @@ struct PortalBrowser: View {
         .sheet(isPresented: $ageKey, onDismiss: {
             guard startSystemBrowser else { return }
             startSystemBrowser = false
-            guard security.unlocked, state.authorized, UIApplication.shared.applicationState == .active, let anchor = state.view?.window else { return }
+            guard security.unlocked, state.authorized, UIApplication.shared.applicationState == .active else { return }
             state.retainedCoordinator?.suspendCapture()
-            browser.open(portal: state.entry, anchor: anchor)
-            state.record("AGEKEY", "Apertura del portale nel browser di sistema non effimero richiesta. Nessuna condivisione della sessione WKWebView presunta")
+            browser.open(portal: state.entry)
+            state.record("AGEKEY", "Apertura esplicita dell’ingresso del portale nel browser esterno richiesta. Nessun esito o sessione trasferito")
         }) {
             AgeKeyBrowserHelp(browser: browser) { startSystemBrowser = true }
         }
@@ -438,18 +466,11 @@ struct PortalBrowser: View {
                         Button("Cancella diagnostica") { state.events.removeAll() }
                     }
                 }
-                .navigationTitle("Diagnostica 1.3")
+                .navigationTitle("Diagnostica 1.3.1")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Chiudi") { diagnostics = false } } }
             }
         }
-        .confirmationDialog("Aprire la pagina corrente in Safari?", isPresented: $safari, titleVisibility: .visible) {
-            Button("Apri in Safari") {
-                guard let url = state.view?.url, url.scheme?.lowercased() == "https" else { return }
-                UIApplication.shared.open(url)
-            }
-        } message: {
-            Text("Alcuni servizi richiedono Safari. Cookie e sessioni della WebView non vengono trasferiti: potrebbe essere necessario accedere di nuovo. phplus si bloccherà in background.")
-        }
+
     }
 }
 
@@ -465,6 +486,7 @@ struct BrowserView: UIViewRepresentable {
         let state: WebState
         weak var host: UIView?
         var windows: [WKWebView] = []
+        var portalItem: WKBackForwardListItem?
         private var cancelDialog: (() -> Void)?
         private weak var dialog: UIAlertController?
         func cancelPendingDialog() {
@@ -494,6 +516,38 @@ struct BrowserView: UIViewRepresentable {
             state.view = windows.last
             if state.hasPopup != (windows.count > 1) { state.hasPopup = windows.count > 1 }
             state.record("POPUP", "Finestra chiusa; sessione del sito conservata")
+        }
+        // Recovery never clears storage or replaces the retained root WebView.
+        func stopForRecovery() {
+            cancelPendingDialog()
+            for view in windows { view.stopLoading() }
+            if windows.count > 1 { close(windows[1]) }
+            suspendCapture()
+        }
+        func returnToPortal() {
+            state.cancellingVerification = true
+            stopForRecovery()
+            state.error = nil
+            guard let root = windows.first else { state.recoveryVisible = true; return }
+            if let current = root.url, let entry = state.entry,
+               RestorationPolicy.restorable(current, entry: entry, method: state.navigationMethods[ObjectIdentifier(root)] ?? "GET") != nil {
+                state.recoveryVisible = false // Already on the portal: no load().
+                resumeMediaIfAllowed(); return
+            }
+            if let item = portalItem, root.backForwardList.backList.contains(where: { $0 === item }) {
+                state.recoveryVisible = false
+                root.go(to: item)
+            } else { state.recoveryVisible = true }
+            state.record("RECUPERO", "Verifica annullata; redirect verso il fornitore sospesi fino a Riapri portale. Nessun cookie eliminato")
+        }
+        func navigateBack() {
+            cancelPendingDialog()
+            guard let current = windows.last else { returnToPortal(); return }
+            current.stopLoading()
+            if current.canGoBack {
+                state.recoveryVisible = false
+                current.goBack() // Allows the provider's preceding method page when in history.
+            } else { returnToPortal() }
         }
         func resumeMediaIfAllowed() {
             guard state.authorized, !state.systemBrowser.active, UIApplication.shared.applicationState == .active, host?.window != nil else { return }
@@ -534,6 +588,10 @@ struct BrowserView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             state.record("NAVIGAZIONE", "Documento caricato")
             updateRestoreCandidate(webView)
+            if webView === windows.first, let entry = state.entry,
+               RestorationPolicy.restorable(webView.url, entry: entry, method: state.navigationMethods[ObjectIdentifier(webView)] ?? "GET") != nil {
+                portalItem = webView.backForwardList.currentItem
+            }
             state.checkpoint()
         }
         func updateRestoreCandidate(_ webView: WKWebView) {
@@ -624,7 +682,14 @@ struct BrowserView: UIViewRepresentable {
             state.record("CONSENSO SITO", "\(origin.host): richiesta \(camera ? "fotocamera" : "")\(microphone ? " microfono" : ""); \(frame.isMainFrame ? "pagina principale" : "pagina incorporata"). Decisione affidata al prompt WebKit")
             decisionHandler(.prompt)
         }
+        func permitsRecoveryNavigation(_ url: URL?) -> Bool {
+            guard state.cancellingVerification, SystemBrowserPolicy.isAgeProvider(url) else { return true }
+            state.recoveryVisible = true
+            state.record("RECUPERO", "Redirect alla verifica fermato dopo annullamento; usa Riapri portale per riprovare")
+            return false
+        }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard permitsRecoveryNavigation(navigationAction.request.url) else { decisionHandler(.cancel); return }
             if SystemBrowserPolicy.isAgeProvider(navigationAction.request.url) {
                 state.ageKeyDetected = true
                 state.record("AGEKEY", "Origine AgeKey/OpenAge rilevata. Il browser di sistema usa l’ingresso originale del portale, senza leggere o trasferire token della verifica")
@@ -642,12 +707,14 @@ struct BrowserView: UIViewRepresentable {
             decisionHandler(.allow)
         }
         func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+            guard permitsRecoveryNavigation(navigationResponse.response.url) else { decisionHandler(.cancel); return }
             if let response = navigationResponse.response as? HTTPURLResponse, response.statusCode >= 400 {
                 state.record("RISPOSTA SITO", "HTTP \(response.statusCode). Possibile rifiuto del servizio; non dimostra da solo un limite della WebView")
             }
             decisionHandler(.allow)
         }
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+            guard !state.cancellingVerification else { state.recoveryVisible = true; return nil }
             guard let host = host, windows.count < 4, navigationAction.targetFrame == nil else { state.record("POPUP", "Finestra non aperta: limite massimo raggiunto"); return nil }
             if let scheme = navigationAction.request.url?.scheme?.lowercased(), !["https", "about"].contains(scheme) { state.record("POPUP", "Protocollo popup non consentito"); return nil }
             // Use WebKit's supplied configuration: keeps opener semantics and shared storage.
