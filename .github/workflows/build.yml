@@ -52,8 +52,8 @@ jobs:
           echo "$DEVICE" > /tmp/phplus-simulator-id
           xcrun simctl boot "$DEVICE"
           xcrun simctl bootstatus "$DEVICE" -b
-          openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/phplus-fixture.key -out /tmp/phplus-fixture.crt -days 1 -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' -addext 'basicConstraints=critical,CA:TRUE'
-          xcrun simctl keychain "$DEVICE" add-root-cert /tmp/phplus-fixture.crt
+          python3 Tests/prepare_https_fixture.py
+          xcrun simctl keychain "$DEVICE" add-root-cert /tmp/phplus-root.cer
           python3 Tests/https_fixture.py > fixture.log 2>&1 &
           xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath test-build -resultBundlePath lifecycle.xcresult -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 IPHONEOS_DEPLOYMENT_TARGET=18.4 CODE_SIGNING_ALLOWED=NO -skip-testing:phplusTests/LifecycleTests/testReadWebStorageAfterRelaunch test | tee tests-write.log
           xcrun simctl terminate "$DEVICE" com.phplus.app || true
