@@ -7,10 +7,7 @@ enum SystemBrowserPolicy {
         guard let url = url, let c = URLComponents(url: url, resolvingAgainstBaseURL: false), c.scheme?.lowercased() == "https", let host = c.host, !host.isEmpty, c.user == nil, c.password == nil else { return nil }
         return url
     }
-    static func isAgeProvider(_ url: URL?) -> Bool {
-        guard let url = url, url.scheme?.lowercased() == "https" else { return false }
-        return ["ui.prod.ageapi.org", "ui.ageapi.org", "api.agekey.org", "agekey.org"].contains(url.host?.lowercased() ?? "")
-    }
+
 }
 
 @MainActor final class SystemBrowserController: ObservableObject {

@@ -20,8 +20,6 @@ import AuthenticationServices
         XCTAssertTrue(controller.status?.contains("Non è un esito di verifica") ?? false)
         XCTAssertNil(SystemBrowserPolicy.entry(URL(string: "http://portal.invalid")))
         XCTAssertNil(SystemBrowserPolicy.entry(URL(string: "https://user:secret@portal.invalid")))
-        XCTAssertTrue(SystemBrowserPolicy.isAgeProvider(URL(string: "https://ui.prod.ageapi.org/verify")))
-        XCTAssertFalse(SystemBrowserPolicy.isAgeProvider(URL(string: "https://ui.prod.ageapi.org.attacker.invalid/verify")))
     }
     func testFailedExternalOpeningLeavesExplicitRecoveryStatus() async {
         let controller = SystemBrowserController { _, done in done(false) }
@@ -30,19 +28,17 @@ import AuthenticationServices
         XCTAssertFalse(controller.active)
         XCTAssertTrue(controller.status?.contains("non aperto") ?? false)
     }
-    func testCancelledVerificationStopsProviderLoopsButRetryIsExplicit() {
+    func testRecoveryDoesNotClassifyProvidersOrRestartThePortal() {
         let state = WebState(); defer { state.dispose() }
         let entry = URL(string: "https://portal.invalid/dashboard")!
         _ = state.prepareHost(url: entry)
         let original = state.view
         state.returnToPortal()
         XCTAssertTrue(state.recoveryVisible)
-        XCTAssertTrue(state.cancellingVerification)
-        XCTAssertFalse(state.coordinator().permitsRecoveryNavigation(URL(string: "https://ui.prod.ageapi.org/verify")))
-        XCTAssertTrue(state.coordinator().permitsRecoveryNavigation(entry))
-        state.setAuthorization(true); state.openEntry()
-        XCTAssertFalse(state.cancellingVerification); XCTAssertFalse(state.recoveryVisible)
-        XCTAssertTrue(state.coordinator().permitsRecoveryNavigation(URL(string: "https://ui.prod.ageapi.org/verify")))
+        XCTAssertTrue(WebNavigationPolicy.allows(URL(string: "https://ui.prod.ageapi.org/face-scan")))
+        state.resumePage()
+        XCTAssertFalse(state.recoveryVisible)
+        XCTAssertEqual(state.initialLoadCount, 0, "Recovery must never load the homepage")
         XCTAssertTrue(state.view === original)
         XCTAssertTrue(state.view!.configuration.websiteDataStore.isPersistent)
     }

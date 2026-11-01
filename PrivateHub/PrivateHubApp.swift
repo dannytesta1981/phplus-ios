@@ -176,7 +176,7 @@ struct RootView: View {
                 // Dismiss sheets so no configuration screen bypasses the lock overlay.
                 editing = nil; settings = false
                 security.backgrounded(); store.setAuthorization(security.unlocked); store.backgrounded()
-            } else if phase == .active { security.becameActive() }
+            } else if phase == .active { security.becameActive(); store.setAuthorization(security.unlocked) }
         }
     }
 }
@@ -240,9 +240,7 @@ struct PortalEditor: View {
     @Published var error: String?
     @Published var events: [String] = []
     @Published var hasPopup = false
-    @Published var ageKeyDetected = false
     @Published var recoveryVisible = false
-    var cancellingVerification = false
     let systemBrowser = SystemBrowserController()
     var mediaSuspended = false
     var closePopup: (() -> Void)?
@@ -274,13 +272,18 @@ struct PortalEditor: View {
     }
     func openEntry() {
         guard authorized else { return }
-        cancellingVerification = false; recoveryVisible = false
+        recoveryVisible = false
         let coordinator = coordinator()
         coordinator.stopForRecovery()
         guard let entry = entry, let view = coordinator.windows.first else { return }
         initialLoadCount = max(initialLoadCount, 1)
         error = nil
+        coordinator.resumeMediaIfAllowed()
         view.load(URLRequest(url: entry))
+    }
+    func resumePage() {
+        recoveryVisible = false; error = nil
+        retainedCoordinator?.resumeMediaIfAllowed()
     }
     func returnToPortal() { coordinator().returnToPortal() }
     func navigateBack() { coordinator().navigateBack() }
@@ -294,7 +297,18 @@ struct PortalEditor: View {
     func prepareHost(url: URL) -> UIView {
         if let host = retainedHost { return host }
         if entry == nil { entry = url }
-        let host = UIView(); retainedHost = host
+        let host = BrowserHost(); retainedHost = host
+        host.onWindowChange = { [weak self] visible in
+            if visible { self?.retainedCoordinator?.resumeMediaIfAllowed() }
+            else {
+                // Ignore detach/reattach within one SwiftUI update. Real background
+                // and explicit Close/lock still stop capture synchronously.
+                Task { @MainActor [weak self, weak host] in
+                    guard host?.window == nil else { return }
+                    self?.retainedCoordinator?.suspendCapture()
+                }
+            }
+        }
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -302,7 +316,6 @@ struct PortalEditor: View {
         configuration.allowsInlineMediaPlayback = true
         configuration.allowsPictureInPictureMediaPlayback = false
         configuration.allowsAirPlayForMediaPlayback = false
-        configuration.userContentController.addUserScript(WKUserScript(source: MediaPrivacyScript.install, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         configuration.userContentController.addUserScript(WKUserScript(source: MediaDiagnostics.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         configuration.userContentController.add(coordinator(), name: "phplusMedia")
         let webView = WKWebView(frame: host.bounds, configuration: configuration)
@@ -398,31 +411,27 @@ struct PortalBrowser: View {
             HStack {
                 Button("Torna al portale") { state.returnToPortal() }.accessibilityIdentifier("returnToPortal")
                 Spacer()
-                Button("Chiudi") { state.returnToPortal(); dismiss() }
+                Button("Chiudi") { state.retainedCoordinator?.suspendCapture(); dismiss() }
             }.padding(10)
-            if state.ageKeyDetected {
-                HStack {
-                    Button("Annulla verifica / altri metodi") { state.navigateBack() }
-                    Spacer()
-                    Button("AgeKey esterna") { ageKey = true }
-                }.font(.footnote).padding(8)
-            }
             if let message = state.error { Text(message).font(.footnote).padding().accessibilityIdentifier("webError") }
             if let status = browser.status { Text(status).font(.footnote).padding(8) }
             ZStack {
                 if let url = URL(string: portal.url) { BrowserView(url: url, state: state) }
                 if state.recoveryVisible {
                     VStack(spacing: 18) {
-                        Text("Verifica annullata").font(.headline)
-                        Text("La pagina del portale non è recuperabile senza un nuovo caricamento, oppure il sito richiede ancora la verifica. Cookie e sessione sono conservati. Nessuna verifica è stata dichiarata riuscita.")
-                        Button("Riapri portale / scegli metodo sul sito") { state.openEntry() }
-                        Button("Usa il portale nel browser esterno") { ageKey = true }
-                        Text("Se il sito non ripropone i metodi, usa i suoi comandi per scegliere Face Scan. phplus non può modificare l’esito o lo stato della verifica.").font(.footnote)
+                        Text("Recupero del portale").font(.headline)
+                        Text("La pagina e i cookie sono conservati. Non è stata avviata una nuova verifica né ricaricata la pagina iniziale.")
+                        Button("Riprendi pagina conservata") { state.resumePage() }
+                        if state.coordinator().canReturnThroughHistory {
+                            Button("Pagina precedente del portale") { state.coordinator().returnThroughHistory() }
+                        }
+                        Button("Riapri pagina iniziale") { state.openEntry() }
+                        Button("Apri portale nel browser esterno") { ageKey = true }
+                        Text("Se il sito continua a richiedere la verifica, usa i suoi comandi per scegliere Face Scan. La riapertura può riproporre la stessa richiesta del servizio.").font(.footnote)
                     }.padding().frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(uiColor: .systemBackground))
                 }
             }
         }
-        .onDisappear { state.retainedCoordinator?.suspendCapture() }
         .onChange(of: scenePhase) { _, phase in if phase == .background { diagnostics = false; startSystemBrowser = false; ageKey = false } }
         .onChange(of: security.unlocked) { _, unlocked in if !unlocked { diagnostics = false; startSystemBrowser = false; ageKey = false } }
         .navigationTitle(portal.title)
@@ -467,11 +476,19 @@ struct PortalBrowser: View {
                         Button("Cancella diagnostica") { state.events.removeAll() }
                     }
                 }
-                .navigationTitle("Diagnostica 1.3.1")
+                .navigationTitle("Diagnostica 1.3.2")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Chiudi") { diagnostics = false } } }
             }
         }
 
+    }
+}
+
+@MainActor final class BrowserHost: UIView {
+    var onWindowChange: ((Bool) -> Void)?
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onWindowChange?(window != nil)
     }
 }
 
@@ -480,7 +497,9 @@ struct BrowserView: UIViewRepresentable {
     @ObservedObject var state: WebState
     func makeUIView(context: Context) -> UIView { state.prepareHost(url: url) }
     func updateUIView(_ uiView: UIView, context: Context) {}
-    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.suspendCapture() }
+    // Actual attachment changes are observed by BrowserHost. SwiftUI may dismantle
+    // a representation while the retained host is still visible (e.g. a sheet).
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {}
     func makeCoordinator() -> Coordinator { state.coordinator() }
 
     @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, PrivacyMediaParticipant {
@@ -488,7 +507,6 @@ struct BrowserView: UIViewRepresentable {
         weak var host: UIView?
         var windows: [WKWebView] = []
         var portalItem: WKBackForwardListItem?
-        var embeddedProvider = false
         private var cancelDialog: (() -> Void)?
         private weak var dialog: UIAlertController?
         func cancelPendingDialog() {
@@ -527,58 +545,60 @@ struct BrowserView: UIViewRepresentable {
             suspendCapture()
         }
         func returnToPortal() {
-            state.cancellingVerification = true
+            let hadPopup = windows.count > 1
             stopForRecovery()
             state.error = nil
-            guard let root = windows.first else { state.recoveryVisible = true; return }
-            // A provider iframe can have no back-stack entry. Do not pretend that
-            // closing a popup or showing its parent cancels that embedded flow.
-            if embeddedProvider { state.recoveryVisible = true; return }
-            if let current = root.url, let entry = state.entry,
-               RestorationPolicy.restorable(current, entry: entry, method: state.navigationMethods[ObjectIdentifier(root)] ?? "GET") != nil {
-                state.recoveryVisible = false // Already on the portal: no load().
-                resumeMediaIfAllowed(); return
-            }
-            if let item = portalItem, root.backForwardList.backList.contains(where: { $0 === item }) {
-                state.recoveryVisible = false
-                root.go(to: item)
-            } else { state.recoveryVisible = true }
-            state.record("RECUPERO", "Verifica annullata; redirect verso il fornitore sospesi fino a Riapri portale. Nessun cookie eliminato")
+            // Closing a child exposes its retained parent without issuing a load.
+            // A same-view or iframe flow cannot safely be reset by host heuristics.
+            // Offer explicit choices instead of another redirect/load/back cycle.
+            state.recoveryVisible = !hadPopup
+            if hadPopup { resumeMediaIfAllowed() }
+            state.record("RECUPERO", "Pagina conservata; nessun dominio bloccato e nessuna riapertura automatica")
+        }
+        var canReturnThroughHistory: Bool {
+            guard let root = windows.first, let item = portalItem else { return false }
+            return root.backForwardList.backList.contains { $0 === item }
+        }
+        func returnThroughHistory() {
+            guard state.authorized, canReturnThroughHistory, let root = windows.first, let item = portalItem else { return }
+            stopForRecovery()
+            state.resumePage()
+            root.go(to: item) // One explicit user action; any legitimate redirect is allowed.
         }
         func navigateBack() {
             cancelPendingDialog()
             guard let current = windows.last else { returnToPortal(); return }
             current.stopLoading()
             if current.canGoBack {
-                state.recoveryVisible = false
+                state.resumePage()
                 current.goBack() // Allows the provider's preceding method page when in history.
             } else { returnToPortal() }
         }
         func resumeMediaIfAllowed() {
-            guard state.authorized, !state.recoveryVisible, !state.systemBrowser.active, UIApplication.shared.applicationState == .active, host?.window != nil else { return }
+            guard state.authorized, !state.recoveryVisible, UIApplication.shared.applicationState == .active, host?.window?.isHidden == false else { return }
             state.mediaSuspended = false
-            for view in windows { view.setAllMediaPlaybackSuspended(false, completionHandler: nil) }
+            // Do not force-play the site's previous stream or obtain a new stream.
+            // No persistent WebKit suspension is used; the page may request capture.
         }
         func suspendCapture() {
+            guard !state.mediaSuspended else { return }
             state.mediaSuspended = true
             cancelPendingDialog()
             for view in windows {
                 view.closeAllMediaPresentations(completionHandler: nil)
                 view.pauseAllMediaPlayback(completionHandler: nil)
-                view.setAllMediaPlaybackSuspended(true) { MediaPrivacyHub.shared.clearOwnSystemMedia() }
-                view.evaluateJavaScript(MediaPrivacyScript.pause, in: nil, in: .defaultClient, completionHandler: nil)
                 view.setCameraCaptureState(.none, completionHandler: nil)
                 view.setMicrophoneCaptureState(.none, completionHandler: nil)
             }
+            MediaPrivacyHub.shared.clearOwnSystemMedia()
         }
         func cleanup() {
+            (host as? BrowserHost)?.onWindowChange = nil
             suspendCapture()
             for view in windows {
                 view.stopLoading()
                 view.closeAllMediaPresentations(completionHandler: nil)
                 view.pauseAllMediaPlayback(completionHandler: nil)
-                view.setAllMediaPlaybackSuspended(true) { MediaPrivacyHub.shared.clearOwnSystemMedia() }
-                view.evaluateJavaScript(MediaPrivacyScript.pause, in: nil, in: .defaultClient, completionHandler: nil)
                 view.setCameraCaptureState(.none, completionHandler: nil)
                 view.setMicrophoneCaptureState(.none, completionHandler: nil)
                 view.configuration.userContentController.removeScriptMessageHandler(forName: "phplusMedia")
@@ -588,7 +608,7 @@ struct BrowserView: UIViewRepresentable {
             state.closePopup = nil
             state.view = nil
         }
-        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { if webView === windows.first { embeddedProvider = false }; state.error = nil; state.restoreCandidates.removeValue(forKey: ObjectIdentifier(webView)); state.onCheckpoint?(nil, nil); state.record("NAVIGAZIONE", "Caricamento iniziato") }
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { state.error = nil; state.restoreCandidates.removeValue(forKey: ObjectIdentifier(webView)); state.onCheckpoint?(nil, nil); state.record("NAVIGAZIONE", "Caricamento iniziato") }
         func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) { state.record("REDIRECT", "Reindirizzamento del sito; archivio cookie persistente invariato") }
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             state.record("NAVIGAZIONE", "Documento caricato")
@@ -620,7 +640,7 @@ struct BrowserView: UIViewRepresentable {
         }
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { state.error = "Pagina interrotta. Premi Ricarica per riprovare."; state.record("WEBKIT", "Processo della pagina terminato") }
         func presenter(for webView: WKWebView) -> UIViewController? {
-            guard state.authorized, !state.recoveryVisible, !state.cancellingVerification, UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
+            guard state.authorized, !state.recoveryVisible, UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
             var top = root
             while let next = top.presentedViewController { top = next }
             return top.presentedViewController == nil && !top.isBeingDismissed ? top : nil
@@ -668,7 +688,7 @@ struct BrowserView: UIViewRepresentable {
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-            guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: state.authorized && !state.recoveryVisible && UIApplication.shared.applicationState == .active), windows.last === webView, webView.window != nil else {
+            guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: state.authorized && !state.recoveryVisible && UIApplication.shared.applicationState == .active), windows.last === webView, webView.window?.isHidden == false else {
                 state.record("PERMESSO NEGATO", "Origine non HTTPS, frame incoerente o pagina non attiva")
                 decisionHandler(.deny); return
             }
@@ -681,7 +701,7 @@ struct BrowserView: UIViewRepresentable {
             @unknown default: state.record("PERMESSO NEGATO", "Tipo di acquisizione non supportato"); decisionHandler(.deny); return
             }
             let statuses = (camera ? [AVCaptureDevice.authorizationStatus(for: .video)] : []) + (microphone ? [AVCaptureDevice.authorizationStatus(for: .audio)] : [])
-            guard !statuses.contains(.denied), !statuses.contains(.restricted) else {
+            guard CaptureConsentPolicy.decision(statuses) == .prompt else {
                 state.record("PERMESSO NEGATO", "Fotocamera o microfono negato/limitato in iOS; controlla Impostazioni di phplus")
                 decisionHandler(.deny); return
             }
@@ -690,21 +710,9 @@ struct BrowserView: UIViewRepresentable {
             state.record("CONSENSO SITO", "\(origin.host): richiesta \(camera ? "fotocamera" : "")\(microphone ? " microfono" : ""); \(frame.isMainFrame ? "pagina principale" : "pagina incorporata"). Decisione affidata al prompt WebKit")
             decisionHandler(.prompt)
         }
-        func permitsRecoveryNavigation(_ url: URL?) -> Bool {
-            guard state.cancellingVerification, SystemBrowserPolicy.isAgeProvider(url) else { return true }
-            state.recoveryVisible = true
-            state.record("RECUPERO", "Redirect alla verifica fermato dopo annullamento; usa Riapri portale per riprovare")
-            return false
-        }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            guard permitsRecoveryNavigation(navigationAction.request.url) else { decisionHandler(.cancel); return }
-            if SystemBrowserPolicy.isAgeProvider(navigationAction.request.url) {
-                if webView === windows.first, navigationAction.targetFrame?.isMainFrame == false { embeddedProvider = true }
-                state.ageKeyDetected = true
-                state.record("AGEKEY", "Origine AgeKey/OpenAge rilevata. Il browser di sistema usa l’ingresso originale del portale, senza leggere o trasferire token della verifica")
-            }
-            guard let scheme = navigationAction.request.url?.scheme?.lowercased(), ["https", "about", "blob", "data"].contains(scheme) else {
-                state.record("LIMITAZIONE", "Navigazione non HTTPS o protocollo esterno non supportato. Usa Apri in Safari se richiesto dal servizio")
+            guard WebNavigationPolicy.allows(navigationAction.request.url) else {
+                state.record("LIMITAZIONE", "Protocollo non supportato; nessuna regola AgeKey applicata")
                 decisionHandler(.cancel); return
             }
             if navigationAction.targetFrame?.isMainFrame == true {
@@ -716,15 +724,12 @@ struct BrowserView: UIViewRepresentable {
             decisionHandler(.allow)
         }
         func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-            if webView === windows.first, !navigationResponse.isForMainFrame, SystemBrowserPolicy.isAgeProvider(navigationResponse.response.url) { embeddedProvider = true; state.ageKeyDetected = true }
-            guard permitsRecoveryNavigation(navigationResponse.response.url) else { decisionHandler(.cancel); return }
             if let response = navigationResponse.response as? HTTPURLResponse, response.statusCode >= 400 {
                 state.record("RISPOSTA SITO", "HTTP \(response.statusCode). Possibile rifiuto del servizio; non dimostra da solo un limite della WebView")
             }
             decisionHandler(.allow)
         }
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-            guard !state.cancellingVerification else { state.recoveryVisible = true; return nil }
             guard let host = host, windows.count < 4, navigationAction.targetFrame == nil else { state.record("POPUP", "Finestra non aperta: limite massimo raggiunto"); return nil }
             if let scheme = navigationAction.request.url?.scheme?.lowercased(), !["https", "about"].contains(scheme) { state.record("POPUP", "Protocollo popup non consentito"); return nil }
             // Use WebKit's supplied configuration: keeps opener semantics and shared storage.

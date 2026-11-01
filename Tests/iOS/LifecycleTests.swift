@@ -138,21 +138,18 @@ import WebKit
         let view = try XCTUnwrap(state.view); try await ready(view)
         let coordinator = state.coordinator()
         _ = try await view.evaluateJavaScript("window.fixtureVolatile = 'no-reload'; document.cookie = 'recovery=ok; Path=/; Secure'")
-        state.returnToPortal() // Already on the portal must not reload it.
+        state.returnToPortal()
+        XCTAssertTrue(state.recoveryVisible)
         let marker = try await view.evaluateJavaScript("window.fixtureVolatile") as? String
         XCTAssertEqual(marker, "no-reload")
-        coordinator.embeddedProvider = true
-        state.returnToPortal()
-        XCTAssertTrue(state.recoveryVisible, "An iframe with no history must offer native recovery")
-        XCTAssertTrue(state.view === view)
-        let retained = try await view.evaluateJavaScript("window.fixtureVolatile") as? String
-        XCTAssertEqual(retained, "no-reload")
-        coordinator.embeddedProvider = false; state.recoveryVisible = false
-        state.cancellingVerification = false
+        state.resumePage()
         view.load(URLRequest(url: URL(string: "https://localhost:8843/provider-error")!))
         try await ready(view, path: "/provider-error")
         XCTAssertNotNil(coordinator.portalItem)
         state.returnToPortal()
+        XCTAssertTrue(state.recoveryVisible)
+        XCTAssertEqual(view.url?.path, "/provider-error", "No automatic back/redirect loop")
+        coordinator.returnThroughHistory() // Explicit, one-shot history return.
         try await ready(view)
         XCTAssertFalse(state.recoveryVisible)
         XCTAssertTrue(state.view === view)
@@ -164,12 +161,10 @@ import WebKit
         state.returnToPortal()
         XCTAssertFalse(state.hasPopup); XCTAssertTrue(state.view === view)
         XCTAssertEqual(coordinator.windows.count, 1)
-        state.navigateBack() // Native action remains callable after popup close/cancel.
-        XCTAssertTrue(state.view === view)
         state.recoveryVisible = true
         coordinator.suspendCapture()
         state.setAuthorization(false); state.setAuthorization(true)
-        XCTAssertTrue(state.mediaSuspended, "Recovery overlay must not allow media to resume on unlock")
+        XCTAssertTrue(state.mediaSuspended, "Native recovery cover is an appropriate pause")
     }
     func testWriteWebStorageAndObserveCameraAPIOnHTTPS() async throws {
         let state = makeFixtureState(); defer { state.dispose() }

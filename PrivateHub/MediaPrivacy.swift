@@ -25,26 +25,6 @@ import MediaPlayer
     }
 }
 
-enum MediaPrivacyScript {
-    // The isolated-world hook only pauses media. It observes no credentials or
-    // verification results and never sends a MessageEvent to the identity service.
-    static let pause = """
-    (() => {
-      for (const element of document.querySelectorAll('video,audio')) { try { element.pause(); } catch (_) {} }
-      try { if (navigator.mediaSession) { navigator.mediaSession.metadata = null; navigator.mediaSession.playbackState = 'none'; } } catch (_) {}
-      return true;
-    })();
-    """
-    static let install = """
-    (() => {
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'hidden') { \(pause) }
-      });
-      window.addEventListener('pagehide', () => { \(pause) });
-    })();
-    """
-}
-
 @MainActor final class PrivacyCurtain {
     private(set) var curtains: [ObjectIdentifier: UIWindow] = [:]
     func hide(in scene: UIWindowScene) {
