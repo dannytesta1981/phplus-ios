@@ -14,6 +14,11 @@ jobs:
         run: |
           brew install xcodegen
           xcodegen generate
+      - name: Permission policy and diagnostics checks
+        run: |
+          swiftc -parse-as-library PrivateHub/CapturePolicy.swift Tests/CapturePolicyChecks.swift -o /tmp/phplus-policy-checks
+          /tmp/phplus-policy-checks
+          node Tests/media-diagnostics.test.cjs
       - name: Build iPhone ARM64
         run: |
           set -o pipefail
@@ -24,22 +29,27 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/phplus.app dist/Payload/
           APP=dist/Payload/phplus.app
           test "$(lipo -archs "$APP/phplus")" = arm64
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = 1.0
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = 1.1
           /usr/libexec/PlistBuddy -c 'Print :NSFaceIDUsageDescription' "$APP/Info.plist"
+          test -n "$(/usr/libexec/PlistBuddy -c 'Print :NSCameraUsageDescription' "$APP/Info.plist")"
+          test -n "$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Info.plist")"
+          test -s "$APP/media-diagnostics.js"
+          strings "$APP/phplus" > dist/binary-strings.txt
+          grep -q 'requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:' dist/binary-strings.txt
           xcrun vtool -show-build "$APP/phplus" | tee dist/verification.txt
           grep -q 'platform IOS' dist/verification.txt
           cd dist
-          zip -qry phplus-unsigned.ipa Payload
-          unzip -t phplus-unsigned.ipa
-          shasum -a 256 phplus-unsigned.ipa > SHA256SUMS.txt
+          zip -qry phplus-1.1-unsigned.ipa Payload
+          unzip -t phplus-1.1-unsigned.ipa
+          shasum -a 256 phplus-1.1-unsigned.ipa > SHA256SUMS.txt
           cd ..
-          zip -qry dist/phplus-ios-source.zip PrivateHub phplus.xcodeproj project.yml README.md .github
+          zip -qry dist/phplus-1.1-source.zip PrivateHub phplus.xcodeproj project.yml README.md .github Tests
       - uses: actions/upload-artifact@v4
         with:
-          name: phplus-1.0
+          name: phplus-1.1
           path: |
-            dist/phplus-unsigned.ipa
-            dist/phplus-ios-source.zip
+            dist/phplus-1.1-unsigned.ipa
+            dist/phplus-1.1-source.zip
             dist/verification.txt
             dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4

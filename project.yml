@@ -5,8 +5,8 @@ options:
     iOS: '17.0'
 settings:
   base:
-    MARKETING_VERSION: 1.0
-    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 1.1
+    CURRENT_PROJECT_VERSION: 2
     ARCHS: arm64
     SWIFT_VERSION: '5.0'
     TARGETED_DEVICE_FAMILY: '1'
@@ -14,6 +14,8 @@ settings:
     CODE_SIGNING_ALLOWED: NO
     GENERATE_INFOPLIST_FILE: YES
     INFOPLIST_KEY_CFBundleDisplayName: phplus
+    INFOPLIST_KEY_NSCameraUsageDescription: "Consenti ai siti che autorizzi di usare la fotocamera per la verifica dell’identità. Nessuna immagine viene raccolta dall’app."
+    INFOPLIST_KEY_NSMicrophoneUsageDescription: "Consenti ai siti che autorizzi di usare il microfono quando richiesto dal loro flusso di verifica."
     INFOPLIST_KEY_NSFaceIDUsageDescription: "Sblocca l'accesso ai tuoi portali privati."
     INFOPLIST_KEY_UIApplicationSupportsDocumentBrowser: NO
     INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES

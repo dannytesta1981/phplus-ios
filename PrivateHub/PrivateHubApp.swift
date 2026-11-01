@@ -1,6 +1,7 @@
 import SwiftUI
 import LocalAuthentication
 import WebKit
+import AVFoundation
 
 @main
 struct phplusApp: App {
@@ -128,7 +129,7 @@ struct RootView: View {
             }
         }
         .overlay { if scenePhase != .active { Color(uiColor: .systemBackground).ignoresSafeArea().overlay(Image(systemName: "lock.fill").font(.largeTitle)) } }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             if phase == .background { selected = nil; editing = nil; security.lock() }
         }
     }
@@ -168,13 +169,36 @@ struct PortalEditor: View {
     }
 }
 
+
 @MainActor final class WebState: ObservableObject {
     weak var view: WKWebView?
     @Published var error: String?
+    @Published var events: [String] = []
+    @Published var hasPopup = false
+    var closePopup: (() -> Void)?
+    func record(_ category: String, _ detail: String) {
+        events.append("[\(category)] \(detail)")
+        if events.count > 80 { events.removeFirst(events.count - 80) }
+    }
+    func captureStatus() {
+        func label(_ status: AVAuthorizationStatus) -> String {
+            switch status {
+            case .authorized: return "autorizzato"
+            case .denied: return "negato: abilita in Impostazioni iOS"
+            case .restricted: return "limitato da iOS"
+            case .notDetermined: return "da richiedere al primo utilizzo"
+            @unknown default: return "sconosciuto"
+            }
+        }
+        record("iOS", "Fotocamera: \(label(AVCaptureDevice.authorizationStatus(for: .video))); microfono: \(label(AVCaptureDevice.authorizationStatus(for: .audio)))")
+    }
 }
+
 struct PortalBrowser: View {
     let portal: Portal
     @StateObject private var state = WebState()
+    @State private var diagnostics = false
+    @State private var safari = false
     var body: some View {
         VStack(spacing: 0) {
             if let message = state.error { Text(message).font(.footnote).padding().accessibilityIdentifier("webError") }
@@ -183,6 +207,13 @@ struct PortalBrowser: View {
         .navigationTitle(portal.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button("Diagnostica", systemImage: "stethoscope") { state.captureStatus(); diagnostics = true }
+                    Button("Apri in Safari", systemImage: "safari") { safari = true }
+                    if state.hasPopup { Button("Chiudi finestra del sito", systemImage: "xmark") { state.closePopup?() } }
+                } label: { Image(systemName: "ellipsis.circle") }
+            }
             ToolbarItemGroup(placement: .bottomBar) {
                 Button { state.view?.goBack() } label: { Image(systemName: "chevron.left") }.accessibilityLabel("Indietro")
                 Button { state.view?.goForward() } label: { Image(systemName: "chevron.right") }.accessibilityLabel("Avanti")
@@ -191,65 +222,187 @@ struct PortalBrowser: View {
                 Button { state.error = nil; state.view?.reload() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Ricarica")
             }
         }
+        .sheet(isPresented: $diagnostics) {
+            NavigationStack {
+                List {
+                    Section { Text("Solo eventi tecnici locali. Nessuna foto, credenziale, percorso URL o testo delle pagine viene registrato. Le origini dei siti sono visibili solo qui. I segnali JavaScript sono indicativi: il sito può alterarli.") }
+                    Section("Eventi recenti") {
+                        ForEach(Array(state.events.enumerated()), id: \.offset) { _, event in Text(event).font(.caption.monospaced()).textSelection(.enabled) }
+                    }
+                    Section {
+                        Button("Aggiorna stato iOS") { state.captureStatus() }
+                        Button("Impostazioni di phplus") { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }
+                        Button("Cancella diagnostica") { state.events.removeAll() }
+                    }
+                }
+                .navigationTitle("Diagnostica 1.1")
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Chiudi") { diagnostics = false } } }
+            }
+        }
+        .confirmationDialog("Aprire la pagina corrente in Safari?", isPresented: $safari, titleVisibility: .visible) {
+            Button("Apri in Safari") {
+                guard let url = state.view?.url, url.scheme?.lowercased() == "https" else { return }
+                UIApplication.shared.open(url)
+            }
+        } message: {
+            Text("Alcuni servizi richiedono Safari. Cookie e sessioni della WebView non vengono trasferiti: potrebbe essere necessario accedere di nuovo. phplus si bloccherà in background.")
+        }
     }
 }
 
 struct BrowserView: UIViewRepresentable {
     let url: URL
     @ObservedObject var state: WebState
-    func makeUIView(context: Context) -> WKWebView {
+    func makeUIView(context: Context) -> UIView {
+        let host = UIView()
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default() // Persistent cookies, cache and site storage.
+        configuration.websiteDataStore = .default()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.navigationDelegate = context.coordinator
-        webView.uiDelegate = context.coordinator
-        webView.allowsBackForwardNavigationGestures = true
-        state.view = webView
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        configuration.allowsInlineMediaPlayback = true
+        configuration.userContentController.addUserScript(WKUserScript(source: MediaDiagnostics.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        configuration.userContentController.add(context.coordinator, name: "phplusMedia")
+        let webView = WKWebView(frame: host.bounds, configuration: configuration)
+        context.coordinator.attach(webView, to: host)
         webView.load(URLRequest(url: url))
-        return webView
+        state.captureStatus()
+        return host
     }
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: UIView, context: Context) {}
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.cleanup() }
     func makeCoordinator() -> Coordinator { Coordinator(state: state) }
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+
+    @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         let state: WebState
+        weak var host: UIView?
+        var windows: [WKWebView] = []
         init(state: WebState) { self.state = state }
-        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { state.error = nil }
+        func attach(_ webView: WKWebView, to host: UIView) {
+            self.host = host
+            webView.frame = host.bounds
+            webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            webView.navigationDelegate = self
+            webView.uiDelegate = self
+            webView.allowsBackForwardNavigationGestures = true
+            host.addSubview(webView)
+            windows.append(webView)
+            state.view = webView
+            state.hasPopup = windows.count > 1
+            state.closePopup = { [weak self] in if let view = self?.windows.last { self?.close(view) } }
+        }
+        func close(_ webView: WKWebView) {
+            guard let index = windows.firstIndex(where: { $0 === webView }), index > 0 else { return }
+            // Descendants belong to the popup too.
+            for view in windows[index...] { view.setCameraCaptureState(.none, completionHandler: nil); view.setMicrophoneCaptureState(.none, completionHandler: nil); view.stopLoading(); view.removeFromSuperview(); view.navigationDelegate = nil; view.uiDelegate = nil }
+            windows.removeSubrange(index...)
+            state.view = windows.last
+            state.hasPopup = windows.count > 1
+            state.record("POPUP", "Finestra chiusa; sessione del sito conservata")
+        }
+        func cleanup() {
+            for view in windows {
+                view.stopLoading()
+                view.setCameraCaptureState(.none, completionHandler: nil)
+                view.setMicrophoneCaptureState(.none, completionHandler: nil)
+                view.configuration.userContentController.removeScriptMessageHandler(forName: "phplusMedia")
+                view.navigationDelegate = nil; view.uiDelegate = nil
+            }
+            windows.removeAll()
+            state.closePopup = nil
+            state.view = nil
+        }
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { state.error = nil; state.record("NAVIGAZIONE", "Caricamento iniziato") }
+        func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) { state.record("REDIRECT", "Reindirizzamento del sito; archivio cookie persistente invariato") }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { state.record("NAVIGAZIONE", "Documento caricato") }
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { report(error) }
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { report(error) }
-        func report(_ error: Error) { if (error as NSError).code != NSURLErrorCancelled { state.error = "Caricamento non riuscito. Controlla la connessione e riprova." } }
-        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { state.error = "Pagina interrotta. Premi Ricarica per riprovare." }
-        private func present(_ alert: UIAlertController, webView: WKWebView) {
-            guard let root = webView.window?.rootViewController else { return }
+        func report(_ error: Error) {
+            let code = (error as NSError).code
+            if code != NSURLErrorCancelled {
+                state.error = "Caricamento non riuscito. Consulta Diagnostica dal menu."
+                state.record("RETE", "Caricamento fallito, codice \(code)")
+            }
+        }
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { state.error = "Pagina interrotta. Premi Ricarica per riprovare."; state.record("WEBKIT", "Processo della pagina terminato") }
+        func presenter(for webView: WKWebView) -> UIViewController? {
+            guard UIApplication.shared.applicationState == .active, let root = webView.window?.rootViewController else { return nil }
             var top = root
             while let next = top.presentedViewController { top = next }
-            top.present(alert, animated: true)
+            return top.presentedViewController == nil && !top.isBeingDismissed ? top : nil
         }
         func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+            guard let top = presenter(for: webView) else { completionHandler(); return }
             let alert = UIAlertController(title: "Messaggio del sito", message: message, preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
-            present(alert, webView: webView)
+            top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+            guard let top = presenter(for: webView) else { completionHandler(false); return }
             let alert = UIAlertController(title: "Conferma del sito", message: message, preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in completionHandler(false) })
             alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
-            present(alert, webView: webView)
+            top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
+            guard let top = presenter(for: webView) else { completionHandler(nil); return }
             let alert = UIAlertController(title: "Richiesta del sito", message: prompt, preferredStyle: .alert)
             alert.addTextField { $0.text = defaultText }
             alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in completionHandler(nil) })
             alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(alert.textFields?.first?.text) })
-            present(alert, webView: webView)
+            top.present(alert, animated: true)
+        }
+        func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+            guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: UIApplication.shared.applicationState == .active), windows.last === webView, webView.window != nil else {
+                state.record("PERMESSO NEGATO", "Origine non HTTPS, frame incoerente o pagina non attiva")
+                decisionHandler(.deny); return
+            }
+            let camera: Bool
+            let microphone: Bool
+            switch type {
+            case .camera: camera = true; microphone = false
+            case .microphone: camera = false; microphone = true
+            case .cameraAndMicrophone: camera = true; microphone = true
+            @unknown default: state.record("PERMESSO NEGATO", "Tipo di acquisizione non supportato"); decisionHandler(.deny); return
+            }
+            let statuses = (camera ? [AVCaptureDevice.authorizationStatus(for: .video)] : []) + (microphone ? [AVCaptureDevice.authorizationStatus(for: .audio)] : [])
+            guard !statuses.contains(.denied), !statuses.contains(.restricted) else {
+                state.record("PERMESSO NEGATO", "Fotocamera o microfono negato/limitato in iOS; controlla Impostazioni di phplus")
+                decisionHandler(.deny); return
+            }
+            // Never auto-grant. WebKit presents its trusted, origin-specific user prompt
+            // and obtains any first-use iOS capture consent using the compiled usage keys.
+            state.record("CONSENSO SITO", "\(origin.host): richiesta \(camera ? "fotocamera" : "")\(microphone ? " microfono" : ""); \(frame.isMainFrame ? "pagina principale" : "pagina incorporata"). Decisione affidata al prompt WebKit")
+            decisionHandler(.prompt)
         }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            guard let scheme = navigationAction.request.url?.scheme?.lowercased(), ["https", "about", "blob", "data"].contains(scheme) else { decisionHandler(.cancel); return }
+            guard let scheme = navigationAction.request.url?.scheme?.lowercased(), ["https", "about", "blob", "data"].contains(scheme) else {
+                state.record("LIMITAZIONE", "Navigazione non HTTPS o protocollo esterno non supportato. Usa Apri in Safari se richiesto dal servizio")
+                decisionHandler(.cancel); return
+            }
+            decisionHandler(.allow)
+        }
+        func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+            if let response = navigationResponse.response as? HTTPURLResponse, response.statusCode >= 400 {
+                state.record("RISPOSTA SITO", "HTTP \(response.statusCode). Possibile rifiuto del servizio; non dimostra da solo un limite della WebView")
+            }
             decisionHandler(.allow)
         }
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-            if navigationAction.targetFrame == nil, let url = navigationAction.request.url, url.scheme?.lowercased() == "https" { webView.load(URLRequest(url: url)) }
-            return nil
+            guard let host = host, windows.count < 4, navigationAction.targetFrame == nil else { state.record("POPUP", "Finestra non aperta: limite massimo raggiunto"); return nil }
+            if let scheme = navigationAction.request.url?.scheme?.lowercased(), !["https", "about"].contains(scheme) { state.record("POPUP", "Protocollo popup non consentito"); return nil }
+            // Use WebKit's supplied configuration: keeps opener semantics and shared storage.
+            let popup = WKWebView(frame: host.bounds, configuration: configuration)
+            attach(popup, to: host)
+            state.record("POPUP", "Finestra aperta con configurazione WebKit; chiusura disponibile nel menu")
+            return popup
+        }
+        func webViewDidClose(_ webView: WKWebView) { close(webView) }
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == "phplusMedia", let body = message.body as? [String: Any], let code = body["code"] as? String, let detail = MediaDiagnostics.messages[code] else { return }
+            let origin = message.frameInfo.securityOrigin
+            let frame = message.frameInfo.isMainFrame ? "principale" : "incorporato"
+            let site = origin.host.isEmpty ? "origine opaca" : origin.host
+            state.record(detail.0, "\(site) [\(frame)]: \(detail.1)")
         }
     }
 }
