@@ -4,11 +4,35 @@ import WebKit
 
 @main
 struct phplusApp: App {
+    @UIApplicationDelegateAdaptor(PrivacyDelegate.self) private var privacy
     @StateObject private var security = SecurityController()
     var body: some Scene {
         WindowGroup {
             RootView().environmentObject(security)
         }
+    }
+}
+
+@MainActor final class PrivacyDelegate: NSObject, UIApplicationDelegate {
+    private var covers: [ObjectIdentifier: UIView] = [:]
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        NotificationCenter.default.addObserver(self, selector: #selector(hideContent(_:)), name: UIScene.willDeactivateNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(showContent(_:)), name: UIScene.didActivateNotification, object: nil)
+        return true
+    }
+    @objc private func hideContent(_ notification: Notification) {
+        guard let scene = notification.object as? UIWindowScene else { return }
+        for window in scene.windows where covers[ObjectIdentifier(window)] == nil {
+            let cover = UIView(frame: window.bounds)
+            cover.backgroundColor = .systemBackground
+            cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            window.addSubview(cover)
+            covers[ObjectIdentifier(window)] = cover
+        }
+    }
+    @objc private func showContent(_ notification: Notification) {
+        guard let scene = notification.object as? UIWindowScene else { return }
+        for window in scene.windows { covers.removeValue(forKey: ObjectIdentifier(window))?.removeFromSuperview() }
     }
 }
 
@@ -81,6 +105,7 @@ struct RootView: View {
                                             .foregroundStyle(.primary)
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                     }
+                                    .buttonStyle(.borderless)
                                     Button { editing = portal } label: { Image(systemName: "pencil").foregroundStyle(.secondary) }
                                         .buttonStyle(.borderless)
                                         .accessibilityLabel("Modifica \(portal.title)")
