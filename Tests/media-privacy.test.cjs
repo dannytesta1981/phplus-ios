@@ -1,0 +1,18 @@
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync('PrivateHub/MediaPrivacy.swift','utf8');
+const pause = source.match(/static let pause = """\n([\s\S]*?)\n    """/)[1];
+const install = source.match(/static let install = """\n([\s\S]*?)\n    """/)[1].split('\\(pause)').join(pause);
+let pauses=0;const listeners={};
+const document={visibilityState:'visible',querySelectorAll:s=>{assert.equal(s,'video,audio');return[{pause:()=>pauses++},{pause:()=>pauses++}]},addEventListener:(n,f)=>listeners[n]=f};
+Object.defineProperty(document,'cookie',{get(){throw Error('must never read cookies')}});
+const navigator={mediaSession:{metadata:{title:'SYNTHETIC_PRIVATE'},playbackState:'playing'}};
+const window={addEventListener:(n,f)=>listeners[n]=f};
+const context={document,navigator,window};
+vm.runInNewContext(install,context);
+listeners.visibilitychange();assert.equal(pauses,0);
+document.visibilityState='hidden';listeners.visibilitychange();assert.equal(pauses,2);assert.equal(navigator.mediaSession.metadata,null);assert.equal(navigator.mediaSession.playbackState,'none');
+listeners.pagehide();assert.equal(pauses,4);
+assert.equal(vm.runInNewContext(pause,context),true);assert.equal(pauses,6);
+console.log('Privacy media JS: hidden/pagehide pause, metadata clearing, and no cookie access: PASS. No physical media/Island test.');

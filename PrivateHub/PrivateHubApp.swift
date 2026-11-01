@@ -15,26 +15,21 @@ struct phplusApp: App {
 }
 
 @MainActor final class PrivacyDelegate: NSObject, UIApplicationDelegate {
-    private var covers: [ObjectIdentifier: UIView] = [:]
+    let curtain = PrivacyCurtain()
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         NotificationCenter.default.addObserver(self, selector: #selector(hideContent(_:)), name: UIScene.willDeactivateNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(showContent(_:)), name: UIScene.didActivateNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(backgrounded), name: UIApplication.didEnterBackgroundNotification, object: nil)
         return true
     }
     @objc private func hideContent(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        for window in scene.windows where covers[ObjectIdentifier(window)] == nil {
-            let cover = UIView(frame: window.bounds)
-            cover.backgroundColor = .systemBackground
-            cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            window.addSubview(cover)
-            covers[ObjectIdentifier(window)] = cover
-        }
+        if let scene = notification.object as? UIWindowScene { curtain.hide(in: scene) }
     }
     @objc private func showContent(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        for window in scene.windows { covers.removeValue(forKey: ObjectIdentifier(window))?.removeFromSuperview() }
+        if let scene = notification.object as? UIWindowScene { curtain.reveal(in: scene) }
+        MediaPrivacyHub.shared.resumeVisible()
     }
+    @objc private func backgrounded() { MediaPrivacyHub.shared.suspendAll() }
 }
 
 struct Portal: Codable, Identifiable, Equatable, Hashable {
@@ -109,7 +104,7 @@ struct Portal: Codable, Identifiable, Equatable, Hashable {
         for state in sessions.values { state.setAuthorization(allowed) }
     }
     func backgrounded() {
-        for state in sessions.values { state.suspendAndCheckpoint() }
+        for state in sessions.values { state.systemBrowser.backgrounded(); state.suspendAndCheckpoint() }
     }
     private func persistResume() {
         guard writable else { return }
@@ -245,6 +240,9 @@ struct PortalEditor: View {
     @Published var error: String?
     @Published var events: [String] = []
     @Published var hasPopup = false
+    @Published var ageKeyDetected = false
+    let systemBrowser = SystemBrowserController()
+    var mediaSuspended = false
     var closePopup: (() -> Void)?
     var entry: URL?
     var restoredURL: URL?
@@ -260,7 +258,7 @@ struct PortalEditor: View {
     private(set) var creationCount = 0
     func setAuthorization(_ allowed: Bool) {
         authorized = allowed
-        if allowed { loadInitialIfNeeded() }
+        if allowed { loadInitialIfNeeded(); retainedCoordinator?.resumeMediaIfAllowed() }
         else { retainedCoordinator?.suspendCapture() }
     }
     func loadInitialIfNeeded() {
@@ -293,6 +291,9 @@ struct PortalEditor: View {
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         configuration.allowsInlineMediaPlayback = true
+        configuration.allowsPictureInPictureMediaPlayback = false
+        configuration.allowsAirPlayForMediaPlayback = false
+        configuration.userContentController.addUserScript(WKUserScript(source: MediaPrivacyScript.install, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient))
         configuration.userContentController.addUserScript(WKUserScript(source: MediaDiagnostics.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         configuration.userContentController.add(coordinator(), name: "phplusMedia")
         let webView = WKWebView(frame: host.bounds, configuration: configuration)
@@ -307,6 +308,8 @@ struct PortalEditor: View {
         checkpoint()
     }
     func dispose() {
+        onCheckpoint = nil
+        systemBrowser.close()
         retainedCoordinator?.cleanup()
         retainedCoordinator = nil; retainedHost = nil
     }
@@ -345,6 +348,13 @@ struct PortalEditor: View {
         events.append("[\(category)] \(detail)")
         if events.count > 80 { events.removeFirst(events.count - 80) }
     }
+    func inspectPasskeyAvailability() {
+        guard let view = view else { return }
+        Task { @MainActor [weak self] in
+            let result = try? await view.callAsyncJavaScript("const api = typeof PublicKeyCredential !== 'undefined'; let platform = null; try { if (api && PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) platform = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(); } catch (_) {} return {api, platform};", arguments: [:], in: nil, contentWorld: .page) as? [String: Any]
+            self?.record("PASSKEY", "API WebAuthn: \((result?["api"] as? Bool) == true ? "presente" : "non osservabile"); disponibilità piattaforma: \((result?["platform"] as? Bool).map { $0 ? "sì" : "no" } ?? "non osservabile"). Non verifica AgeKey, dominio associato o credenziali salvate. Usa il browser di sistema per domini esterni")
+        }
+    }
     func captureStatus() {
         func label(_ status: AVAuthorizationStatus) -> String {
             switch status {
@@ -364,22 +374,34 @@ struct PortalBrowser: View {
     @EnvironmentObject private var security: SecurityController
     let portal: Portal
     @ObservedObject var state: WebState
+    @ObservedObject private var browser: SystemBrowserController
+    init(portal: Portal, state: WebState) {
+        self.portal = portal
+        self._state = ObservedObject(wrappedValue: state)
+        self._browser = ObservedObject(wrappedValue: state.systemBrowser)
+    }
+    @State private var startSystemBrowser = false
     @State private var diagnostics = false
     @State private var safari = false
+    @State private var ageKey = false
     var body: some View {
         VStack(spacing: 0) {
+            if state.ageKeyDetected {
+                Button("AgeKey: continua nel browser di sistema") { ageKey = true }.font(.footnote).padding(8)
+            }
             if let message = state.error { Text(message).font(.footnote).padding().accessibilityIdentifier("webError") }
             if let url = URL(string: portal.url) { BrowserView(url: url, state: state) }
         }
         .onDisappear { state.retainedCoordinator?.suspendCapture() }
-        .onChange(of: scenePhase) { _, phase in if phase == .background { diagnostics = false; safari = false } }
-        .onChange(of: security.unlocked) { _, unlocked in if !unlocked { diagnostics = false; safari = false } }
+        .onChange(of: scenePhase) { _, phase in if phase == .background { diagnostics = false; safari = false; startSystemBrowser = false; ageKey = false } }
+        .onChange(of: security.unlocked) { _, unlocked in if !unlocked { diagnostics = false; safari = false; startSystemBrowser = false; ageKey = false } }
         .navigationTitle(portal.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
-                    Button("Diagnostica", systemImage: "stethoscope") { state.captureStatus(); diagnostics = true }
+                    Button("Diagnostica", systemImage: "stethoscope") { state.captureStatus(); state.inspectPasskeyAvailability(); diagnostics = true }
+                    Button("AgeKey / browser di sistema", systemImage: "key") { ageKey = true }
                     Button("Apri in Safari", systemImage: "safari") { safari = true }
                     if state.hasPopup { Button("Chiudi finestra del sito", systemImage: "xmark") { state.closePopup?() } }
                 } label: { Image(systemName: "ellipsis.circle") }
@@ -392,6 +414,17 @@ struct PortalBrowser: View {
                 Button { state.error = nil; state.view?.reload() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Ricarica")
             }
         }
+        .sheet(isPresented: $ageKey, onDismiss: {
+            guard startSystemBrowser else { return }
+            startSystemBrowser = false
+            guard security.unlocked, state.authorized, UIApplication.shared.applicationState == .active, let anchor = state.view?.window else { return }
+            state.retainedCoordinator?.suspendCapture()
+            browser.open(portal: state.entry, anchor: anchor)
+            state.record("AGEKEY", "Apertura del portale nel browser di sistema non effimero richiesta. Nessuna condivisione della sessione WKWebView presunta")
+        }) {
+            AgeKeyBrowserHelp(browser: browser) { startSystemBrowser = true }
+        }
+        .onChange(of: browser.active) { _, active in if !active { state.retainedCoordinator?.resumeMediaIfAllowed() } }
         .sheet(isPresented: $diagnostics) {
             NavigationStack {
                 List {
@@ -405,7 +438,7 @@ struct PortalBrowser: View {
                         Button("Cancella diagnostica") { state.events.removeAll() }
                     }
                 }
-                .navigationTitle("Diagnostica 1.2")
+                .navigationTitle("Diagnostica 1.3")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Chiudi") { diagnostics = false } } }
             }
         }
@@ -428,7 +461,7 @@ struct BrowserView: UIViewRepresentable {
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.suspendCapture() }
     func makeCoordinator() -> Coordinator { state.coordinator() }
 
-    @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, PrivacyMediaParticipant {
         let state: WebState
         weak var host: UIView?
         var windows: [WKWebView] = []
@@ -439,7 +472,7 @@ struct BrowserView: UIViewRepresentable {
             cancelDialog?()
             cancelDialog = nil; dialog = nil
         }
-        init(state: WebState) { self.state = state }
+        init(state: WebState) { self.state = state; super.init(); MediaPrivacyHub.shared.register(self) }
         func attach(_ webView: WKWebView, to host: UIView) {
             self.host = host
             webView.frame = host.bounds
@@ -462,17 +495,31 @@ struct BrowserView: UIViewRepresentable {
             if state.hasPopup != (windows.count > 1) { state.hasPopup = windows.count > 1 }
             state.record("POPUP", "Finestra chiusa; sessione del sito conservata")
         }
+        func resumeMediaIfAllowed() {
+            guard state.authorized, !state.systemBrowser.active, UIApplication.shared.applicationState == .active, host?.window != nil else { return }
+            state.mediaSuspended = false
+            for view in windows { view.setAllMediaPlaybackSuspended(false, completionHandler: nil) }
+        }
         func suspendCapture() {
+            state.mediaSuspended = true
             cancelPendingDialog()
             for view in windows {
+                view.closeAllMediaPresentations(completionHandler: nil)
+                view.pauseAllMediaPlayback(completionHandler: nil)
+                view.setAllMediaPlaybackSuspended(true) { MediaPrivacyHub.shared.clearOwnSystemMedia() }
+                view.evaluateJavaScript(MediaPrivacyScript.pause, in: nil, in: .defaultClient, completionHandler: nil)
                 view.setCameraCaptureState(.none, completionHandler: nil)
                 view.setMicrophoneCaptureState(.none, completionHandler: nil)
             }
         }
         func cleanup() {
-            cancelPendingDialog()
+            suspendCapture()
             for view in windows {
                 view.stopLoading()
+                view.closeAllMediaPresentations(completionHandler: nil)
+                view.pauseAllMediaPlayback(completionHandler: nil)
+                view.setAllMediaPlaybackSuspended(true) { MediaPrivacyHub.shared.clearOwnSystemMedia() }
+                view.evaluateJavaScript(MediaPrivacyScript.pause, in: nil, in: .defaultClient, completionHandler: nil)
                 view.setCameraCaptureState(.none, completionHandler: nil)
                 view.setMicrophoneCaptureState(.none, completionHandler: nil)
                 view.configuration.userContentController.removeScriptMessageHandler(forName: "phplusMedia")
@@ -578,6 +625,10 @@ struct BrowserView: UIViewRepresentable {
             decisionHandler(.prompt)
         }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if SystemBrowserPolicy.isAgeProvider(navigationAction.request.url) {
+                state.ageKeyDetected = true
+                state.record("AGEKEY", "Origine AgeKey/OpenAge rilevata. Il browser di sistema usa l’ingresso originale del portale, senza leggere o trasferire token della verifica")
+            }
             guard let scheme = navigationAction.request.url?.scheme?.lowercased(), ["https", "about", "blob", "data"].contains(scheme) else {
                 state.record("LIMITAZIONE", "Navigazione non HTTPS o protocollo esterno non supportato. Usa Apri in Safari se richiesto dal servizio")
                 decisionHandler(.cancel); return
@@ -600,6 +651,8 @@ struct BrowserView: UIViewRepresentable {
             guard let host = host, windows.count < 4, navigationAction.targetFrame == nil else { state.record("POPUP", "Finestra non aperta: limite massimo raggiunto"); return nil }
             if let scheme = navigationAction.request.url?.scheme?.lowercased(), !["https", "about"].contains(scheme) { state.record("POPUP", "Protocollo popup non consentito"); return nil }
             // Use WebKit's supplied configuration: keeps opener semantics and shared storage.
+            configuration.allowsPictureInPictureMediaPlayback = false
+            configuration.allowsAirPlayForMediaPlayback = false
             let popup = WKWebView(frame: host.bounds, configuration: configuration)
             state.navigationMethods[ObjectIdentifier(popup)] = navigationAction.request.httpMethod ?? "GET"
             attach(popup, to: host)

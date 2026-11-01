@@ -5,8 +5,8 @@ options:
     iOS: '17.0'
 settings:
   base:
-    MARKETING_VERSION: 1.2
-    CURRENT_PROJECT_VERSION: 3
+    MARKETING_VERSION: 1.3
+    CURRENT_PROJECT_VERSION: 4
     ARCHS: arm64
     SWIFT_VERSION: '5.0'
     TARGETED_DEVICE_FAMILY: '1'
@@ -17,6 +17,7 @@ settings:
     INFOPLIST_KEY_NSCameraUsageDescription: "Consenti ai siti che autorizzi di usare la fotocamera per la verifica dell’identità. Nessuna immagine viene raccolta dall’app."
     INFOPLIST_KEY_NSMicrophoneUsageDescription: "Consenti ai siti che autorizzi di usare il microfono quando richiesto dal loro flusso di verifica."
     INFOPLIST_KEY_NSFaceIDUsageDescription: "Sblocca l'accesso ai tuoi portali privati."
+    INFOPLIST_KEY_NSSupportsLiveActivities: NO
     INFOPLIST_KEY_UIApplicationSupportsDocumentBrowser: NO
     INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
     INFOPLIST_KEY_UILaunchScreen_Generation: YES
