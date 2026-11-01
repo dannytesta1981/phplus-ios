@@ -35,8 +35,9 @@ import LocalAuthentication
     init(defaults: UserDefaults = .standard, authenticator: DeviceAuthenticating? = nil) {
         self.defaults = defaults
         self.authenticator = authenticator ?? DeviceAuthenticator()
-        enabled = defaults.object(forKey: "phplus.security.lockEnabled") as? Bool ?? true
-        unlocked = !enabled
+        let initial = defaults.object(forKey: "phplus.security.lockEnabled") as? Bool ?? true
+        enabled = initial
+        unlocked = !initial
     }
     func becameActive() {
         guard automaticPending, !busy else { return }

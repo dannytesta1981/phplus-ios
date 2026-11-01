@@ -425,7 +425,7 @@ struct BrowserView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { state.coordinator() }
 
     @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-        unowned let state: WebState
+        let state: WebState
         weak var host: UIView?
         var windows: [WKWebView] = []
         init(state: WebState) { self.state = state }
