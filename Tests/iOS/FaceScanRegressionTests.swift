@@ -25,7 +25,8 @@ import AVFoundation
             return (try await view.evaluateJavaScript("document.readyState === 'complete' && location.pathname === '\(path)' && !!document.getElementById('fixtureReady')")) as? Bool == true
         }
     }
-    func visibleState() throws -> (WebState, UIWindow) {
+    func visibleState() async throws -> (WebState, UIWindow) {
+        try await waitFor { UIApplication.shared.applicationState == .active }
         let state = WebState()
         state.entry = URL(string: "https://localhost:8843/dashboard")!
         state.setAuthorization(true)
@@ -73,7 +74,7 @@ import AVFoundation
         XCTAssertTrue(WebNavigationPolicy.allows(URL(string: "data:text/html,fixture")))
     }
     func testCaptureDelegateWithRealMainAndCrossOriginFrameContexts() async throws {
-        let (state, window) = try visibleState()
+        let (state, window) = try await visibleState()
         defer { state.dispose(); window.isHidden = true }
         let view = try XCTUnwrap(state.view)
         let collector = FrameCollector()
@@ -113,13 +114,12 @@ import AVFoundation
         // not grant OS consent, obtain a camera stream or perform a facial scan.
     }
     func testPreviewPlaybackSurvivesInactiveEventsAndCanRestartAfterBackground() async throws {
-        let (state, window) = try visibleState()
+        let (state, window) = try await visibleState()
         defer { state.dispose(); window.isHidden = true }
         let view = try XCTUnwrap(state.view)
         view.load(URLRequest(url: URL(string: "https://localhost:8843/preview")!))
         try await ready(view, path: "/preview")
-        try await waitFor { (try await view.evaluateJavaScript("document.getElementById('preview').readyState >= 2")) as? Bool == true }
-        let play = "const v=document.getElementById('preview'); v.muted=true; await v.play(); return !v.paused;"
+        let play = "const v=document.getElementById('preview'); v.muted=true; await Promise.race([v.play(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('synthetic preview play timeout')),10000))]); return !v.paused && v.readyState>=2;"
         let initial = try await view.callAsyncJavaScript(play, arguments: [:], in: nil, contentWorld: .page) as? Bool
         XCTAssertEqual(initial, true)
         _ = try await view.evaluateJavaScript("Object.defineProperty(document,'visibilityState',{configurable:true,get:()=> 'hidden'}); document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('pagehide')); delete document.visibilityState")
@@ -141,7 +141,7 @@ import AVFoundation
         // Ordinary synthetic video, not camera/video identity verification.
     }
     func testHTTPSRedirectsPOSTAndPopupStillWorkAfterRepeatedRecovery() async throws {
-        let (state, window) = try visibleState()
+        let (state, window) = try await visibleState()
         defer { state.dispose(); window.isHidden = true }
         let view = try XCTUnwrap(state.view)
         try await ready(view, path: "/dashboard")
@@ -179,7 +179,7 @@ import AVFoundation
         XCTAssertEqual(state.initialLoadCount, 1)
     }
     func testNetworkFailureOffersRecoveryWithoutAutomaticHomepageReload() async throws {
-        let (state, window) = try visibleState()
+        let (state, window) = try await visibleState()
         defer { state.dispose(); window.isHidden = true }
         let view = try XCTUnwrap(state.view)
         try await ready(view, path: "/dashboard")

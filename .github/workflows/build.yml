@@ -32,7 +32,24 @@ jobs:
           python3 Tests/prepare_https_fixture.py
           xcrun simctl keychain "$DEVICE" add-root-cert /tmp/phplus-root.cer
           python3 Tests/https_fixture.py > fixture.log 2>&1 &
-          xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath test-build -resultBundlePath lifecycle.xcresult -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 IPHONEOS_DEPLOYMENT_TARGET=18.4 CODE_SIGNING_ALLOWED=NO -skip-testing:phplusTests/LifecycleTests/testReadWebStorageAfterRelaunch test | tee tests-write.log
+          xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath test-build IPHONEOS_DEPLOYMENT_TARGET=18.4 CODE_SIGNING_ALLOWED=NO build-for-testing | tee tests-build.log
+          xcrun simctl install "$DEVICE" test-build/Build/Products/Debug-iphonesimulator/phplus.app
+          CONTAINER=$(xcrun simctl get_app_container "$DEVICE" com.phplus.app data)
+          mkdir -p "$CONTAINER/Library/Preferences"
+          /usr/libexec/PlistBuddy -c 'Add :phplus.security.lockEnabled bool false' "$CONTAINER/Library/Preferences/com.phplus.app.plist"
+          # Disposable simulator only: use the existing lock-off preference for the
+          # fixture host. Production IPA defaults/authentication code are unchanged.
+          # The isolated SecurityController tests still exercise the default lock.
+          (
+            for ATTEMPT in $(seq 1 90); do
+              if test -f tests-write.log && grep -q "Test Suite .*started" tests-write.log; then
+                xcrun simctl launch "$DEVICE" com.phplus.app > activation.log 2>&1 || true
+                break
+              fi
+              sleep 1
+            done
+          ) &
+          xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath test-build -resultBundlePath lifecycle.xcresult -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 IPHONEOS_DEPLOYMENT_TARGET=18.4 CODE_SIGNING_ALLOWED=NO -skip-testing:phplusTests/LifecycleTests/testReadWebStorageAfterRelaunch test-without-building | tee tests-write.log
           xcrun simctl terminate "$DEVICE" com.phplus.app || true
           xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath test-build -resultBundlePath persistence.xcresult -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 IPHONEOS_DEPLOYMENT_TARGET=18.4 CODE_SIGNING_ALLOWED=NO -only-testing:phplusTests/LifecycleTests/testReadWebStorageAfterRelaunch test | tee tests-read.log
           printf 'Simulator: iPhone 16 Pro, iOS 18.5. Two separate XCTest host processes. Simulator-only minimum deployment target 18.4 for WebKit bug 293831; device IPA remains iOS 17+. Physical Face ID/camera and provider identity acceptance: NOT TESTED.\n' > dist/test-scope.txt
@@ -73,6 +90,8 @@ jobs:
             dist/verification.txt
             dist/SHA256SUMS.txt
             dist/test-scope.txt
+            tests-build.log
+            activation.log
             tests-write.log
             tests-read.log
             lifecycle.xcresult
@@ -83,6 +102,8 @@ jobs:
           name: build-log
           path: |
             build.log
+            tests-build.log
+            activation.log
             tests-write.log
             tests-read.log
             fixture.log
