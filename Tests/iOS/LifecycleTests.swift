@@ -184,7 +184,7 @@ import WebKit
         XCTAssertEqual(result as? String, "ok")
         let cookies = await view.configuration.websiteDataStore.httpCookieStore.phplusCookieSnapshot()
         XCTAssertTrue(cookies.contains { $0.name == "phplus_fixture" && !$0.isSessionOnly })
-        UserDefaults.standard.set(true, forKey: "phplus.tests.fixtureWasWritten")
+        try ProtectedFiles.application.write("fixture-written", name: "test-first-process.json")
         let observed = expectation(description: "Cookie and web-data checkpoint")
         var done = false
         state.onCheckpoint = { _, evidence in if evidence?.localKeys != nil && !done { done = true; observed.fulfill() } }
@@ -192,7 +192,7 @@ import WebKit
         await fulfillment(of: [observed], timeout: 15)
     }
     func testReadWebStorageAfterRelaunch() async throws {
-        XCTAssertTrue(UserDefaults.standard.bool(forKey: "phplus.tests.fixtureWasWritten"), "This test must run in the second xcodebuild test invocation")
+        XCTAssertEqual(try ProtectedFiles.application.read("test-first-process.json", as: String.self), "fixture-written", "Atomic test marker must survive the first test-host process")
         let state = makeFixtureState(); defer { state.dispose() }
         let view = try XCTUnwrap(state.view); try await ready(view)
         let local = try await view.evaluateJavaScript("localStorage.getItem('phplus_fixture')") as? String
