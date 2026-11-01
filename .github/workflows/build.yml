@@ -1,0 +1,49 @@
+name: Build phplus IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Build iPhone ARM64
+        run: |
+          set -o pipefail
+          xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build | tee build.log
+      - name: Package and verify
+        run: |
+          mkdir -p dist/Payload
+          cp -R build/Build/Products/Release-iphoneos/phplus.app dist/Payload/
+          APP=dist/Payload/phplus.app
+          test "$(lipo -archs "$APP/phplus")" = arm64
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = 1.0
+          /usr/libexec/PlistBuddy -c 'Print :NSFaceIDUsageDescription' "$APP/Info.plist"
+          xcrun vtool -show-build "$APP/phplus" | tee dist/verification.txt
+          grep -q 'platform IOS' dist/verification.txt
+          cd dist
+          zip -qry phplus-unsigned.ipa Payload
+          unzip -t phplus-unsigned.ipa
+          shasum -a 256 phplus-unsigned.ipa > SHA256SUMS.txt
+          cd ..
+          zip -qry dist/phplus-ios-source.zip PrivateHub phplus.xcodeproj project.yml README.md .github
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phplus-1.0
+          path: |
+            dist/phplus-unsigned.ipa
+            dist/phplus-ios-source.zip
+            dist/verification.txt
+            dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
