@@ -29,7 +29,7 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/phplus.app dist/Payload/
           APP=dist/Payload/phplus.app
           test "$(lipo -archs "$APP/phplus")" = arm64
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = 1.1
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = 1.2
           /usr/libexec/PlistBuddy -c 'Print :NSFaceIDUsageDescription' "$APP/Info.plist"
           test -n "$(/usr/libexec/PlistBuddy -c 'Print :NSCameraUsageDescription' "$APP/Info.plist")"
           test -n "$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Info.plist")"
@@ -39,21 +39,47 @@ jobs:
           xcrun vtool -show-build "$APP/phplus" | tee dist/verification.txt
           grep -q 'platform IOS' dist/verification.txt
           cd dist
-          zip -qry phplus-1.1-unsigned.ipa Payload
-          unzip -t phplus-1.1-unsigned.ipa
-          shasum -a 256 phplus-1.1-unsigned.ipa > SHA256SUMS.txt
+          zip -qry phplus-1.2-unsigned.ipa Payload
+          unzip -t phplus-1.2-unsigned.ipa
+          shasum -a 256 phplus-1.2-unsigned.ipa > SHA256SUMS.txt
           cd ..
-          zip -qry dist/phplus-1.1-source.zip PrivateHub phplus.xcodeproj project.yml README.md .github Tests
+          zip -qry dist/phplus-1.2-source.zip PrivateHub phplus.xcodeproj project.yml README.md .github Tests
+      - name: Real WebKit and lifecycle tests on iOS 18.5 simulator
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          DEVICE=$(xcrun simctl create phplus-1-2-tests com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro com.apple.CoreSimulator.SimRuntime.iOS-18-5)
+          echo "$DEVICE" > /tmp/phplus-simulator-id
+          xcrun simctl boot "$DEVICE"
+          xcrun simctl bootstatus "$DEVICE" -b
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/phplus-fixture.key -out /tmp/phplus-fixture.crt -days 1 -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' -addext 'basicConstraints=critical,CA:TRUE'
+          xcrun simctl keychain "$DEVICE" add-root-cert /tmp/phplus-fixture.crt
+          python3 Tests/https_fixture.py > fixture.log 2>&1 &
+          xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath test-build -resultBundlePath lifecycle.xcresult CODE_SIGNING_ALLOWED=NO -skip-testing:phplusTests/LifecycleTests/testReadWebStorageAfterRelaunch test | tee tests-write.log
+          xcrun simctl terminate "$DEVICE" com.phplus.app || true
+          xcodebuild -project phplus.xcodeproj -scheme phplus -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE" -derivedDataPath test-build -resultBundlePath persistence.xcresult CODE_SIGNING_ALLOWED=NO -only-testing:phplusTests/LifecycleTests/testReadWebStorageAfterRelaunch test | tee tests-read.log
+          printf 'Simulator: iPhone 16 Pro, iOS 18.5. Two separate XCTest host processes. Physical Face ID/camera and provider identity acceptance: NOT TESTED.\n' > dist/test-scope.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: phplus-1.1
+          name: phplus-1.2
           path: |
-            dist/phplus-1.1-unsigned.ipa
-            dist/phplus-1.1-source.zip
+            dist/phplus-1.2-unsigned.ipa
+            dist/phplus-1.2-source.zip
             dist/verification.txt
             dist/SHA256SUMS.txt
+            dist/test-scope.txt
+            tests-write.log
+            tests-read.log
+            lifecycle.xcresult
+            persistence.xcresult
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: build-log
-          path: build.log
+          path: |
+            build.log
+            tests-write.log
+            tests-read.log
+            fixture.log
+            lifecycle.xcresult
+            persistence.xcresult

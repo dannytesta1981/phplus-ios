@@ -5,8 +5,8 @@ options:
     iOS: '17.0'
 settings:
   base:
-    MARKETING_VERSION: 1.1
-    CURRENT_PROJECT_VERSION: 2
+    MARKETING_VERSION: 1.2
+    CURRENT_PROJECT_VERSION: 3
     ARCHS: arm64
     SWIFT_VERSION: '5.0'
     TARGETED_DEVICE_FAMILY: '1'
@@ -33,3 +33,24 @@ targets:
       base:
         PRODUCT_NAME: phplus
         INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+
+  phplusTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/iOS
+    dependencies:
+      - target: phplus
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.phplus.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/phplus.app/phplus"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  phplus:
+    build:
+      targets:
+        phplus: all
+    test:
+      targets:
+        - phplusTests

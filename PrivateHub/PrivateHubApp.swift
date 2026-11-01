@@ -37,36 +37,6 @@ struct phplusApp: App {
     }
 }
 
-@MainActor final class SecurityController: ObservableObject {
-    @Published var unlocked = false
-    @Published var errorMessage: String?
-    private var context: LAContext?
-    private var generation = 0
-    func lock() { generation += 1; context?.invalidate(); context = nil; unlocked = false }
-    func unlock() {
-        guard context == nil else { return }
-        let context = LAContext()
-        self.context = context
-        let attempt = generation
-        context.localizedFallbackTitle = "Usa codice iPhone"
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
-            self.context = nil
-            errorMessage = "Configura Face ID o un codice dispositivo per proteggere l'app."
-            return
-        }
-        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Accedi ai portali privati") { success, error in
-            Task { @MainActor in
-                guard attempt == self.generation else { return }
-                self.context = nil
-                self.unlocked = success
-                if !success { self.errorMessage = error?.localizedDescription ?? "Autenticazione non riuscita" }
-                else { self.errorMessage = nil }
-            }
-        }
-    }
-}
-
 struct Portal: Codable, Identifiable, Equatable, Hashable {
     var id: Int
     var title: String
@@ -74,17 +44,78 @@ struct Portal: Codable, Identifiable, Equatable, Hashable {
 }
 
 @MainActor final class PortalStore: ObservableObject {
-    @Published var portals: [Portal] = [] { didSet { save() } }
-    private let key = "privatehub.portals.v1"
-    init() {
-        if let data = UserDefaults.standard.data(forKey: key), let value = try? JSONDecoder().decode([Portal].self, from: data) {
-            portals = value
-        } else {
-            portals = (1...3).map { Portal(id: $0, title: "Portale \($0)", url: "") }
+    @Published private(set) var portals: [Portal] = []
+    @Published var storageError: String?
+    private var sessions: [Int: WebState] = [:]
+    private let files: ProtectedFiles
+    private var resume = ResumeState()
+    private var writable = true
+    private var authorized = false
+    private var coldPortalID: Int?
+    init(files: ProtectedFiles = .application, defaults: UserDefaults = .standard) {
+        self.files = files
+        do {
+            if let saved = try files.read("portals.json", as: [Portal].self) { portals = saved; defaults.removeObject(forKey: "privatehub.portals.v1") }
+            else if let legacy = defaults.data(forKey: "privatehub.portals.v1"), let saved = try? JSONDecoder().decode([Portal].self, from: legacy) {
+                portals = saved
+                try files.write(saved, name: "portals.json")
+                defaults.removeObject(forKey: "privatehub.portals.v1")
+            } else { portals = (1...3).map { Portal(id: $0, title: "Portale \($0)", url: "") } }
+            resume = try files.read("resume.json", as: ResumeState.self) ?? ResumeState()
+            coldPortalID = resume.activePortal
+        } catch {
+            writable = false
+            storageError = "Dati locali non accessibili. Chiudi e riapri dopo aver sbloccato iPhone; i file esistenti non saranno sovrascritti."
         }
     }
-    private func save() { if let data = try? JSONEncoder().encode(portals) { UserDefaults.standard.set(data, forKey: key) } }
-    func update(_ portal: Portal) { if let index = portals.firstIndex(where: { $0.id == portal.id }) { portals[index] = portal } }
+    func update(_ portal: Portal) {
+        guard writable, let index = portals.firstIndex(where: { $0.id == portal.id }) else { return }
+        var updated = portals; updated[index] = portal
+        do {
+            try files.write(updated, name: "portals.json")
+            if portals[index].url != portal.url {
+                sessions.removeValue(forKey: portal.id)?.dispose()
+                resume.pages.removeValue(forKey: portal.id)
+                resume.evidence.removeValue(forKey: portal.id)
+            }
+            portals = updated; persistResume()
+        } catch { storageError = "Impossibile salvare le impostazioni del portale." }
+    }
+    var restoredPortal: Portal? { portals.first { $0.id == resume.activePortal && !$0.url.isEmpty } }
+    func activate(_ id: Int?) { resume.activePortal = id; persistResume() }
+    func session(for portal: Portal) -> WebState {
+        if let existing = sessions[portal.id] { return existing }
+        let state = WebState()
+        state.entry = URL(string: portal.url)
+        state.authorized = authorized
+        state.coldRestoration = coldPortalID == portal.id
+        if state.coldRestoration { coldPortalID = nil }
+        if let entry = state.entry, let saved = resume.pages[portal.id], let url = URL(string: saved) {
+            state.restoredURL = RestorationPolicy.restorable(url, entry: entry)
+        }
+        state.previousEvidence = resume.evidence[portal.id]
+        state.onCheckpoint = { [weak self] url, evidence in
+            guard let self = self else { return }
+            if let url = url { self.resume.pages[portal.id] = url.absoluteString }
+            else { self.resume.pages.removeValue(forKey: portal.id) }
+            if let evidence = evidence { self.resume.evidence[portal.id] = evidence }
+            self.persistResume()
+        }
+        sessions[portal.id] = state
+        return state
+    }
+    func setAuthorization(_ allowed: Bool) {
+        authorized = allowed
+        for state in sessions.values { state.setAuthorization(allowed) }
+    }
+    func backgrounded() {
+        for state in sessions.values { state.suspendAndCheckpoint() }
+    }
+    private func persistResume() {
+        guard writable else { return }
+        do { try files.write(resume, name: "resume.json") }
+        catch { storageError = "Impossibile salvare il punto di ripresa. I dati web restano gestiti da WebKit." }
+    }
 }
 
 struct RootView: View {
@@ -93,44 +124,83 @@ struct RootView: View {
     @StateObject private var store = PortalStore()
     @State private var selected: Portal?
     @State private var editing: Portal?
+    @State private var settings = false
+    @State private var restored = false
     var body: some View {
-        Group {
-            if security.unlocked {
-                NavigationStack {
-                    List {
-                        Section("Portali") {
-                            ForEach(store.portals) { portal in
-                                HStack {
-                                    Button { if !portal.url.isEmpty { selected = portal } else { editing = portal } } label: {
-                                        Label(portal.title, systemImage: "globe")
-                                            .foregroundStyle(.primary)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                    .buttonStyle(.borderless)
-                                    Button { editing = portal } label: { Image(systemName: "pencil").foregroundStyle(.secondary) }
-                                        .buttonStyle(.borderless)
-                                        .accessibilityLabel("Modifica \(portal.title)")
-                                }
+        ZStack {
+            NavigationStack {
+                List {
+                    Section("Portali") {
+                        ForEach(store.portals) { portal in
+                            HStack {
+                                Button { if !portal.url.isEmpty { selected = portal } else { editing = portal } } label: {
+                                    Label(portal.title, systemImage: "globe").foregroundStyle(.primary).frame(maxWidth: .infinity, alignment: .leading)
+                                }.buttonStyle(.borderless)
+                                Button { editing = portal } label: { Image(systemName: "pencil").foregroundStyle(.secondary) }
+                                    .buttonStyle(.borderless).accessibilityLabel("Modifica \(portal.title)")
                             }
                         }
-                        Section { Button("Blocca ora", systemImage: "lock.fill") { selected = nil; security.lock() } }
                     }
-                    .navigationTitle("phplus")
-                    .sheet(item: $editing) { portal in PortalEditor(portal: portal) { store.update($0) } }
-                    .navigationDestination(item: $selected) { portal in PortalBrowser(portal: portal) }
+                    Section {
+                        Button("Impostazioni", systemImage: "gearshape") { settings = true }
+                        if security.enabled { Button("Blocca ora", systemImage: "lock.fill") { security.lock() } }
+                    }
+                    if let message = store.storageError { Section { Text(message).foregroundStyle(.red) } }
                 }
-            } else {
+                .navigationTitle("phplus")
+                .sheet(item: $editing) { portal in PortalEditor(portal: portal) { store.update($0) } }
+                .sheet(isPresented: $settings) { SecuritySettings().environmentObject(security) }
+                .navigationDestination(item: $selected) { portal in PortalBrowser(portal: portal, state: store.session(for: portal)) }
+            }
+            .allowsHitTesting(security.unlocked && scenePhase == .active)
+            .accessibilityHidden(!security.unlocked || scenePhase != .active)
+            if !security.unlocked {
+                Color(uiColor: .systemBackground).ignoresSafeArea()
                 VStack(spacing: 20) {
                     Image(systemName: "lock.shield").font(.system(size: 55))
                     Text("phplus").font(.title.bold())
-                    Button("Sblocca con Face ID") { security.unlock() }.buttonStyle(.borderedProminent)
-                    if let error = security.errorMessage { Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center) }
+                    if security.busy { ProgressView("Autenticazione in corso…") }
+                    if let message = security.errorMessage {
+                        Text(message).font(.footnote).multilineTextAlignment(.center)
+                        Button("Riprova Face ID / codice iPhone") { security.unlock() }.buttonStyle(.borderedProminent)
+                    }
                 }.padding()
             }
         }
-        .overlay { if scenePhase != .active { Color(uiColor: .systemBackground).ignoresSafeArea().overlay(Image(systemName: "lock.fill").font(.largeTitle)) } }
+        .overlay { if scenePhase != .active { Color(uiColor: .systemBackground).ignoresSafeArea() } }
+        .task {
+            if !restored { selected = store.restoredPortal; restored = true }
+            store.setAuthorization(security.unlocked)
+            if scenePhase == .active { security.becameActive() }
+        }
+        .onChange(of: security.unlocked) { _, unlocked in store.setAuthorization(unlocked) }
+        .onChange(of: selected) { _, portal in store.activate(portal?.id) }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .background { selected = nil; editing = nil; security.lock() }
+            if phase == .background {
+                // Keep the selected portal and the same WKWebView hierarchy alive.
+                // Dismiss sheets so no configuration screen bypasses the lock overlay.
+                editing = nil; settings = false
+                security.backgrounded(); store.setAuthorization(security.unlocked); store.backgrounded()
+            } else if phase == .active { security.becameActive() }
+        }
+    }
+}
+
+struct SecuritySettings: View {
+    @EnvironmentObject private var security: SecurityController
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Sicurezza") {
+                    Toggle("Blocco Face ID / codice iPhone", isOn: Binding(get: { security.enabled }, set: { security.setEnabled($0) })).disabled(security.busy)
+                    Text("Attivo per impostazione predefinita. Lo sblocco parte automaticamente all’avvio e dopo il background. Ogni modifica richiede Face ID o il codice iPhone.").font(.footnote)
+                    if security.busy { ProgressView("Conferma la modifica con iOS…") }
+                    if let message = security.errorMessage { Text(message).foregroundStyle(.secondary) }
+                }
+            }
+            .navigationTitle("Impostazioni")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Chiudi") { dismiss() } } }
         }
     }
 }
@@ -176,6 +246,101 @@ struct PortalEditor: View {
     @Published var events: [String] = []
     @Published var hasPopup = false
     var closePopup: (() -> Void)?
+    var entry: URL?
+    var restoredURL: URL?
+    var previousEvidence: StorageEvidence?
+    var onCheckpoint: ((URL?, StorageEvidence?) -> Void)?
+    var retainedHost: UIView?
+    var retainedCoordinator: BrowserView.Coordinator?
+    var navigationMethods: [ObjectIdentifier: String] = [:]
+    var restoreCandidates: [ObjectIdentifier: URL] = [:]
+    var authorized = false
+    var coldRestoration = false
+    private(set) var initialLoadCount = 0
+    private(set) var creationCount = 0
+    func setAuthorization(_ allowed: Bool) {
+        authorized = allowed
+        if allowed { loadInitialIfNeeded() }
+        else { retainedCoordinator?.suspendCapture() }
+    }
+    func loadInitialIfNeeded() {
+        guard authorized, initialLoadCount == 0, let view = retainedCoordinator?.windows.first, let url = restoredURL ?? entry else { return }
+        if coldRestoration && restoredURL == nil && RestorationPolicy.restorable(url, entry: url) == nil {
+            Task { @MainActor [weak self] in self?.error = "Ripresa automatica non consentita per questa pagina. Usa Pagina iniziale per aprirla esplicitamente." }
+            return
+        }
+        initialLoadCount += 1
+        view.load(URLRequest(url: url))
+    }
+    func openEntry() {
+        guard authorized, let entry = entry, let view = view else { return }
+        initialLoadCount = max(initialLoadCount, 1)
+        error = nil
+        view.load(URLRequest(url: entry))
+    }
+    func coordinator() -> BrowserView.Coordinator {
+        if let value = retainedCoordinator { return value }
+        let value = BrowserView.Coordinator(state: self)
+        retainedCoordinator = value
+        return value
+    }
+    func prepareHost(url: URL) -> UIView {
+        if let host = retainedHost { return host }
+        if entry == nil { entry = url }
+        let host = UIView(); retainedHost = host
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        configuration.allowsInlineMediaPlayback = true
+        configuration.userContentController.addUserScript(WKUserScript(source: MediaDiagnostics.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        configuration.userContentController.add(coordinator(), name: "phplusMedia")
+        let webView = WKWebView(frame: host.bounds, configuration: configuration)
+        didCreate(); coordinator().attach(webView, to: host)
+        loadInitialIfNeeded()
+        Task { @MainActor [weak self] in self?.captureStatus() }
+        return host
+    }
+    func didCreate() { creationCount += 1 }
+    func suspendAndCheckpoint() {
+        retainedCoordinator?.suspendCapture()
+        checkpoint()
+    }
+    func dispose() {
+        retainedCoordinator?.cleanup()
+        retainedCoordinator = nil; retainedHost = nil
+    }
+    func checkpoint() {
+        guard let view = view else { return }
+        retainedCoordinator?.updateRestoreCandidate(view)
+        let safe = restoreCandidates[ObjectIdentifier(view)]
+        // Persist the navigation decision immediately; the cookie inspection below
+        // is asynchronous observation, NOT a public WebKit disk-flush API.
+        onCheckpoint?(safe, nil)
+        let task = BackgroundCheckpoint()
+        task.start()
+        Task { @MainActor [weak self, weak view] in
+            defer { task.finish() }
+            guard let self = self, let view = view else { return }
+            let inspectedURL = view.url
+            let cookies = await view.configuration.websiteDataStore.httpCookieStore.allCookies()
+            guard view.url == inspectedURL else { return }
+            let host = inspectedURL?.host?.lowercased() ?? ""
+            let relevant = cookies.filter { cookie in let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")); return host == domain || host.hasSuffix("." + domain) }
+            let counts = try? await view.callAsyncJavaScript("let local = null; let databases = null; try { local = localStorage.length; } catch (_) {} try { if (indexedDB.databases) databases = (await indexedDB.databases()).length; } catch (_) {} return {local, databases};", arguments: [:], in: nil, contentWorld: .defaultClient) as? [String: Any]
+            guard view.url == inspectedURL else { return }
+            let evidence = StorageEvidence(origin: host, cookies: relevant.count, persistentCookies: relevant.filter { !$0.isSessionOnly }.count, localKeys: counts?["local"] as? Int, databases: counts?["databases"] as? Int)
+            self.record("DATI WEB", "Store persistente; cookie visibili: \(evidence.cookies), persistenti: \(evidence.persistentCookies); localStorage: \(evidence.localKeys.map(String.init) ?? "non osservabile"), IndexedDB: \(evidence.databases.map(String.init) ?? "non osservabile"). Nessun valore copiato")
+            if let old = self.previousEvidence, old.origin == evidence.origin {
+                if old.cookies > evidence.cookies || (old.localKeys ?? 0) > (evidence.localKeys ?? 0) || (old.databases ?? 0) > (evidence.databases ?? 0) {
+                    self.record("CONFRONTO DATI", "Quantità locali diminuite: possibile scadenza, modifica del sito o perdita locale; causa non determinabile dai soli conteggi")
+                } else { self.record("CONFRONTO DATI", "Conteggi presenti: non provano che la verifica sia ancora valida. Una nuova richiesta può dipendere dal servizio o da stato effimero") }
+            }
+            self.previousEvidence = evidence
+            // Do not let an older asynchronous completion overwrite a newer URL.
+            self.onCheckpoint?(self.view.flatMap { self.restoreCandidates[ObjectIdentifier($0)] }, evidence)
+        }
+    }
     func record(_ category: String, _ detail: String) {
         events.append("[\(category)] \(detail)")
         if events.count > 80 { events.removeFirst(events.count - 80) }
@@ -196,7 +361,7 @@ struct PortalEditor: View {
 
 struct PortalBrowser: View {
     let portal: Portal
-    @StateObject private var state = WebState()
+    @ObservedObject var state: WebState
     @State private var diagnostics = false
     @State private var safari = false
     var body: some View {
@@ -204,6 +369,7 @@ struct PortalBrowser: View {
             if let message = state.error { Text(message).font(.footnote).padding().accessibilityIdentifier("webError") }
             if let url = URL(string: portal.url) { BrowserView(url: url, state: state) }
         }
+        .onDisappear { state.retainedCoordinator?.suspendCapture() }
         .navigationTitle(portal.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -218,7 +384,7 @@ struct PortalBrowser: View {
                 Button { state.view?.goBack() } label: { Image(systemName: "chevron.left") }.accessibilityLabel("Indietro")
                 Button { state.view?.goForward() } label: { Image(systemName: "chevron.right") }.accessibilityLabel("Avanti")
                 Spacer()
-                Button { if let url = URL(string: portal.url) { state.view?.load(URLRequest(url: url)) } } label: { Image(systemName: "house") }.accessibilityLabel("Pagina iniziale")
+                Button { state.openEntry() } label: { Image(systemName: "house") }.accessibilityLabel("Pagina iniziale")
                 Button { state.error = nil; state.view?.reload() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Ricarica")
             }
         }
@@ -235,7 +401,7 @@ struct PortalBrowser: View {
                         Button("Cancella diagnostica") { state.events.removeAll() }
                     }
                 }
-                .navigationTitle("Diagnostica 1.1")
+                .navigationTitle("Diagnostica 1.2")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Chiudi") { diagnostics = false } } }
             }
         }
@@ -253,27 +419,13 @@ struct PortalBrowser: View {
 struct BrowserView: UIViewRepresentable {
     let url: URL
     @ObservedObject var state: WebState
-    func makeUIView(context: Context) -> UIView {
-        let host = UIView()
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
-        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        configuration.allowsInlineMediaPlayback = true
-        configuration.userContentController.addUserScript(WKUserScript(source: MediaDiagnostics.script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        configuration.userContentController.add(context.coordinator, name: "phplusMedia")
-        let webView = WKWebView(frame: host.bounds, configuration: configuration)
-        context.coordinator.attach(webView, to: host)
-        webView.load(URLRequest(url: url))
-        state.captureStatus()
-        return host
-    }
+    func makeUIView(context: Context) -> UIView { state.prepareHost(url: url) }
     func updateUIView(_ uiView: UIView, context: Context) {}
-    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.cleanup() }
-    func makeCoordinator() -> Coordinator { Coordinator(state: state) }
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.suspendCapture() }
+    func makeCoordinator() -> Coordinator { state.coordinator() }
 
     @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-        let state: WebState
+        unowned let state: WebState
         weak var host: UIView?
         var windows: [WKWebView] = []
         init(state: WebState) { self.state = state }
@@ -287,7 +439,7 @@ struct BrowserView: UIViewRepresentable {
             host.addSubview(webView)
             windows.append(webView)
             state.view = webView
-            state.hasPopup = windows.count > 1
+            if state.hasPopup != (windows.count > 1) { state.hasPopup = windows.count > 1 }
             state.closePopup = { [weak self] in if let view = self?.windows.last { self?.close(view) } }
         }
         func close(_ webView: WKWebView) {
@@ -296,8 +448,14 @@ struct BrowserView: UIViewRepresentable {
             for view in windows[index...] { view.setCameraCaptureState(.none, completionHandler: nil); view.setMicrophoneCaptureState(.none, completionHandler: nil); view.stopLoading(); view.removeFromSuperview(); view.navigationDelegate = nil; view.uiDelegate = nil }
             windows.removeSubrange(index...)
             state.view = windows.last
-            state.hasPopup = windows.count > 1
+            if state.hasPopup != (windows.count > 1) { state.hasPopup = windows.count > 1 }
             state.record("POPUP", "Finestra chiusa; sessione del sito conservata")
+        }
+        func suspendCapture() {
+            for view in windows {
+                view.setCameraCaptureState(.none, completionHandler: nil)
+                view.setMicrophoneCaptureState(.none, completionHandler: nil)
+            }
         }
         func cleanup() {
             for view in windows {
@@ -311,9 +469,23 @@ struct BrowserView: UIViewRepresentable {
             state.closePopup = nil
             state.view = nil
         }
-        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { state.error = nil; state.record("NAVIGAZIONE", "Caricamento iniziato") }
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { state.error = nil; state.restoreCandidates.removeValue(forKey: ObjectIdentifier(webView)); state.onCheckpoint?(nil, nil); state.record("NAVIGAZIONE", "Caricamento iniziato") }
         func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) { state.record("REDIRECT", "Reindirizzamento del sito; archivio cookie persistente invariato") }
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { state.record("NAVIGAZIONE", "Documento caricato") }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            state.record("NAVIGAZIONE", "Documento caricato")
+            updateRestoreCandidate(webView)
+            state.checkpoint()
+        }
+        func updateRestoreCandidate(_ webView: WKWebView) {
+            let key = ObjectIdentifier(webView)
+            if let entry = state.entry, let safe = RestorationPolicy.restorable(webView.url, entry: entry, method: state.navigationMethods[key] ?? "GET") {
+                state.restoreCandidates[key] = safe
+                state.record("RIPRESA", "Pagina GET ammessa per il riavvio completo")
+            } else {
+                state.restoreCandidates.removeValue(forKey: key)
+                state.record("RIPRESA", "Pagina esclusa dal riavvio automatico: percorso non ammesso, query, fragment, origine o operazione sensibile. In memoria resta intatta")
+            }
+        }
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { report(error) }
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { report(error) }
         func report(_ error: Error) {
@@ -352,7 +524,7 @@ struct BrowserView: UIViewRepresentable {
             top.present(alert, animated: true)
         }
         func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-            guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: UIApplication.shared.applicationState == .active), windows.last === webView, webView.window != nil else {
+            guard CapturePolicy.allows(requestScheme: origin.protocol, requestHost: origin.host, requestPort: origin.port, frameScheme: frame.securityOrigin.protocol, frameHost: frame.securityOrigin.host, framePort: frame.securityOrigin.port, pageScheme: webView.url?.scheme, active: state.authorized && UIApplication.shared.applicationState == .active), windows.last === webView, webView.window != nil else {
                 state.record("PERMESSO NEGATO", "Origine non HTTPS, frame incoerente o pagina non attiva")
                 decisionHandler(.deny); return
             }
@@ -379,6 +551,12 @@ struct BrowserView: UIViewRepresentable {
                 state.record("LIMITAZIONE", "Navigazione non HTTPS o protocollo esterno non supportato. Usa Apri in Safari se richiesto dal servizio")
                 decisionHandler(.cancel); return
             }
+            if navigationAction.targetFrame?.isMainFrame == true {
+                let key = ObjectIdentifier(webView)
+                state.navigationMethods[key] = navigationAction.request.httpMethod ?? "GET"
+                state.restoreCandidates.removeValue(forKey: key)
+                state.onCheckpoint?(nil, nil)
+            }
             decisionHandler(.allow)
         }
         func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
@@ -392,6 +570,7 @@ struct BrowserView: UIViewRepresentable {
             if let scheme = navigationAction.request.url?.scheme?.lowercased(), !["https", "about"].contains(scheme) { state.record("POPUP", "Protocollo popup non consentito"); return nil }
             // Use WebKit's supplied configuration: keeps opener semantics and shared storage.
             let popup = WKWebView(frame: host.bounds, configuration: configuration)
+            state.navigationMethods[ObjectIdentifier(popup)] = navigationAction.request.httpMethod ?? "GET"
             attach(popup, to: host)
             state.record("POPUP", "Finestra aperta con configurazione WebKit; chiusura disponibile nel menu")
             return popup
